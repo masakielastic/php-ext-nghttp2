@@ -158,7 +158,7 @@ final class Server
 }
 ```
 
-`setResponse()` の `headers` は次のどちらでも指定できます。
+`setResponse()` accepts headers in either of the following formats:
 
 ```php
 [
@@ -167,7 +167,7 @@ final class Server
 ]
 ```
 
-`content-length` は内部で再計算されます。
+`content-length` is recalculated internally.
 
 ---
 

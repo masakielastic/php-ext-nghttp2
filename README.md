@@ -73,7 +73,7 @@ All extension sources reside in ext/.
 Register repository:
 
 ```
-pie repository:add vcs https://github.com/<your-account>/php-nghttp2
+pie repository:add vcs https://github.com/masakielastic/php-nghttp2
 ```
 
 Install:

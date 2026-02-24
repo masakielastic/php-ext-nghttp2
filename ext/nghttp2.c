@@ -28,7 +28,7 @@ zend_module_entry nghttp2_module_entry = {
     STANDARD_MODULE_PROPERTIES
 };
 
-#ifdef COMPILE_DL_NGHTTP2
+#if defined(COMPILE_DL_NGHTTP2) || defined(COMPILE_DL_EXT) || defined(ZEND_COMPILE_DL_NGHTTP2) || defined(ZEND_COMPILE_DL_EXT)
 # ifdef ZTS
 ZEND_TSRMLS_CACHE_DEFINE()
 # endif

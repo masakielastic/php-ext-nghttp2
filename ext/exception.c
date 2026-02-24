@@ -1,6 +1,10 @@
 #include "php_nghttp2.h"
+#include <Zend/zend_exceptions.h>
 
 zend_class_entry *nghttp2_ce_hpack_exception;
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_nghttp2_hpack_exception_get_nghttp2_error_code, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
 
 ZEND_METHOD(Nghttp2_HpackException, getNghttp2ErrorCode)
 {
@@ -13,7 +17,7 @@ ZEND_METHOD(Nghttp2_HpackException, getNghttp2ErrorCode)
 }
 
 static const zend_function_entry nghttp2_hpack_exception_methods[] = {
-    ZEND_ME(Nghttp2_HpackException, getNghttp2ErrorCode, NULL, ZEND_ACC_PUBLIC)
+    ZEND_ME(Nghttp2_HpackException, getNghttp2ErrorCode, arginfo_nghttp2_hpack_exception_get_nghttp2_error_code, ZEND_ACC_PUBLIC)
     ZEND_FE_END
 };
 
@@ -34,6 +38,10 @@ void nghttp2_throw_hpack_exception(const char *message, int error_code)
 
     if (EG(exception) != NULL) {
         ZVAL_LONG(&zv, error_code);
+#if PHP_VERSION_ID >= 80500
+        zend_update_property(nghttp2_ce_hpack_exception, EG(exception), "nghttp2ErrorCode", sizeof("nghttp2ErrorCode") - 1, &zv);
+#else
         zend_update_property(nghttp2_ce_hpack_exception, Z_OBJ(EG(exception)), "nghttp2ErrorCode", sizeof("nghttp2ErrorCode") - 1, &zv);
+#endif
     }
 }

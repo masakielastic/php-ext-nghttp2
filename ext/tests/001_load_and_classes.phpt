@@ -15,8 +15,10 @@ var_dump(class_exists('Nghttp2\\Server'));
 var_dump(class_exists('Nghttp2\\Exception\\HpackException'));
 var_dump(class_exists('Nghttp2\\Exception\\ClientException'));
 var_dump(class_exists('Nghttp2\\Exception\\ServerException'));
+var_dump(method_exists('Nghttp2\\Server', 'setResponse'));
 ?>
 --EXPECT--
+bool(true)
 bool(true)
 bool(true)
 bool(true)

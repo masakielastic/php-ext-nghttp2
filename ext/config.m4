@@ -11,6 +11,6 @@ if test "$PHP_NGHTTP2" != "no"; then
   PHP_EVAL_LIBLINE($NGHTTP2_LIBS, NGHTTP2_SHARED_LIBADD)
   PHP_EVAL_LIBLINE($OPENSSL_LIBS, NGHTTP2_SHARED_LIBADD)
 
-  PHP_NEW_EXTENSION([nghttp2], [nghttp2.c hpack.c client.c exception.c], [$ext_shared])
+  PHP_NEW_EXTENSION([nghttp2], [nghttp2.c hpack.c client.c server.c exception.c], [$ext_shared])
   PHP_SUBST([NGHTTP2_SHARED_LIBADD])
 fi

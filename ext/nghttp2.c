@@ -6,6 +6,7 @@ PHP_MINIT_FUNCTION(nghttp2)
     nghttp2_register_exception_class();
     nghttp2_register_hpack_class();
     nghttp2_register_client_class();
+    nghttp2_register_server_class();
     return SUCCESS;
 }
 

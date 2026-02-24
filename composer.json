@@ -1,5 +1,5 @@
 {
-  "name": "masakielastic/php-nghttp2",
+  "name": "masakielastic/php-ext-nghttp2",
   "description": "PHP extension for low-level HTTP/2 primitives powered by nghttp2",
   "version": "0.1.0",
   "type": "php-ext",

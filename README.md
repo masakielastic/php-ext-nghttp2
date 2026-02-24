@@ -44,7 +44,11 @@ On Debian/Ubuntu:
 
 ```bash
 sudo apt install libnghttp2-dev pkg-config
-Directory Structure
+```
+
+---
+
+## Directory Structure
 .
 ├── composer.json
 ├── README.md
@@ -59,23 +63,43 @@ Directory Structure
 
 All extension sources reside in ext/.
 
-Installation (PIE)
+---
+
+## Installation (PIE)
 
 Register repository:
 
+```
 pie repository:add vcs https://github.com/<your-account>/php-nghttp2
+```
 
 Install:
 
+```
 pie install php-nghttp2
+```
 
 Verify:
 
+```
 php -m | grep nghttp2
-Namespace
+```
+
+---
+
+## Namespace
+
+```php
 namespace Nghttp2;
-HPACK API
+```
+
+---
+
+## HPACK API
+
 Class: Nghttp2\Hpack
+
+```
 final class Hpack
 {
     public function __construct(int $maxDynamicTableSize = 4096);
@@ -89,21 +113,31 @@ final class Hpack
     public function encode(array $headers): string;
     public function decode(string $headerBlock): array;
 }
-Header Format
+```
+
+---
+
+## Header Format
 
 Encoding requires list format:
 
+```php
 [
     ['name' => ':method', 'value' => 'GET'],
     ['name' => ':path', 'value' => '/'],
     ['name' => 'host', 'value' => 'example.com'],
 ]
+```
 
 Decoding returns the same list format.
 
 Headers are treated as raw binary strings.
 
-Example
+---
+
+## Example
+
+```
 use Nghttp2\Hpack;
 
 $hpack = new Hpack();
@@ -119,42 +153,53 @@ $block = $hpack->encode($headers);
 $decoded = $hpack->decode($block);
 
 var_dump($decoded);
-Error Handling
+```
+
+---
+
+## Error Handling
 
 All nghttp2-related failures throw:
 
+```php
 Nghttp2\Exception\HpackException
+```
 
 Error codes can be retrieved:
 
+```php
 $e->getNghttp2ErrorCode();
-Design Principles
+```
 
-Minimal abstraction
+---
 
-Explicit state control
+## Design Principles
 
-No implicit I/O
+ * Minimal abstraction
+ * Explicit state control
+ * No implicit I/O
+ * Suitable for RFC experimentation
+ * Designed for low-level HTTP/2 work
 
-Suitable for RFC experimentation
+---
 
-Designed for low-level HTTP/2 work
+## Non-Goals
+ * High-level HTTP client abstraction
+ * PSR-7 integration
+ * Asynchronous event loop integration
+ * HTTP/3 (QPACK)
 
-Non-Goals
+---
 
-High-level HTTP client abstraction
-
-PSR-7 integration
-
-Asynchronous event loop integration
-
-HTTP/3 (QPACK)
-
-License
+## License
 
 MIT (or your chosen license)
 
-Status
+---
 
+## Status
+
+Experimental.
+Intended for educational and low-level HTTP/2 experimentation.
 Experimental.
 Intended for educational and low-level HTTP/2 experimentation.

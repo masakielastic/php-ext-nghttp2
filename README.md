@@ -49,6 +49,8 @@ sudo apt install libnghttp2-dev pkg-config
 ---
 
 ## Directory Structure
+
+```
 .
 ├── composer.json
 ├── README.md
@@ -60,6 +62,7 @@ sudo apt install libnghttp2-dev pkg-config
     ├── server.c          # planned
     ├── exception.c
     └── php_nghttp2.h
+```
 
 All extension sources reside in ext/.
 

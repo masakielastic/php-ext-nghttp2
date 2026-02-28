@@ -674,59 +674,6 @@ static int nghttp2_session_require_open(nghttp2_session_object *intern)
     return SUCCESS;
 }
 
-static int nghttp2_session_build_nv_array(zval *headers, nghttp2_nv **nva_out, size_t *nvlen_out)
-{
-    HashTable *header_ht;
-    nghttp2_nv *nva;
-    zval *entry;
-    size_t nvlen;
-    size_t i = 0;
-
-    header_ht = Z_ARRVAL_P(headers);
-    nvlen = zend_hash_num_elements(header_ht);
-    *nvlen_out = nvlen;
-    if (nvlen == 0) {
-        *nva_out = NULL;
-        return SUCCESS;
-    }
-
-    nva = ecalloc(nvlen, sizeof(*nva));
-
-    ZEND_HASH_FOREACH_VAL(header_ht, entry) {
-        zval *name;
-        zval *value;
-
-        if (Z_TYPE_P(entry) != IS_ARRAY) {
-            efree(nva);
-            zend_type_error("each header must be an array with keys 'name' and 'value'");
-            return FAILURE;
-        }
-
-        name = zend_hash_str_find(Z_ARRVAL_P(entry), "name", sizeof("name") - 1);
-        value = zend_hash_str_find(Z_ARRVAL_P(entry), "value", sizeof("value") - 1);
-        if (name == NULL || value == NULL) {
-            efree(nva);
-            zend_type_error("each header must contain both 'name' and 'value'");
-            return FAILURE;
-        }
-        if (Z_TYPE_P(name) != IS_STRING || Z_TYPE_P(value) != IS_STRING) {
-            efree(nva);
-            zend_type_error("header 'name' and 'value' must be strings");
-            return FAILURE;
-        }
-
-        nva[i].name = (uint8_t *)Z_STRVAL_P(name);
-        nva[i].value = (uint8_t *)Z_STRVAL_P(value);
-        nva[i].namelen = Z_STRLEN_P(name);
-        nva[i].valuelen = Z_STRLEN_P(value);
-        nva[i].flags = NGHTTP2_NV_FLAG_NONE;
-        i++;
-    } ZEND_HASH_FOREACH_END();
-
-    *nva_out = nva;
-    return SUCCESS;
-}
-
 static int nghttp2_session_build_settings_entries(
     zval *settings,
     nghttp2_settings_entry **iv_out,
@@ -814,7 +761,7 @@ static int nghttp2_session_submit_headers_internal(
         return FAILURE;
     }
 
-    if (nghttp2_session_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
+    if (nghttp2_headers_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
         return FAILURE;
     }
 
@@ -1081,7 +1028,7 @@ ZEND_METHOD(Nghttp2_Session, submitRequest)
     if (nghttp2_session_require_open(intern) != SUCCESS) {
         RETURN_THROWS();
     }
-    if (nghttp2_session_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
+    if (nghttp2_headers_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
         RETURN_THROWS();
     }
 

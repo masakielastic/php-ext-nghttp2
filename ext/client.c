@@ -441,64 +441,19 @@ ZEND_METHOD(Nghttp2_Client, __construct)
     nghttp2_client_reset_response(intern);
 }
 
-static int nghttp2_client_append_custom_headers(nghttp2_nv *nva, uint32_t offset, zval *headers)
-{
-    HashTable *ht = Z_ARRVAL_P(headers);
-    zval *entry;
-    zend_string *key;
-    zend_ulong index;
-    uint32_t i = offset;
-
-    ZEND_HASH_FOREACH_KEY_VAL(ht, index, key, entry) {
-        zval *name = NULL;
-        zval *value = NULL;
-
-        if (key != NULL) {
-            if (Z_TYPE_P(entry) != IS_STRING) {
-                zend_type_error("when using associative headers, each value must be string");
-                return FAILURE;
-            }
-            nva[i].name = (uint8_t *)ZSTR_VAL(key);
-            nva[i].namelen = ZSTR_LEN(key);
-            nva[i].value = (uint8_t *)Z_STRVAL_P(entry);
-            nva[i].valuelen = Z_STRLEN_P(entry);
-            nva[i].flags = NGHTTP2_NV_FLAG_NONE;
-            i++;
-            continue;
-        }
-
-        if (Z_TYPE_P(entry) != IS_ARRAY) {
-            zend_type_error("each header must be string value or array{name, value}");
-            return FAILURE;
-        }
-        name = zend_hash_str_find(Z_ARRVAL_P(entry), "name", sizeof("name") - 1);
-        value = zend_hash_str_find(Z_ARRVAL_P(entry), "value", sizeof("value") - 1);
-        if (name == NULL || value == NULL || Z_TYPE_P(name) != IS_STRING || Z_TYPE_P(value) != IS_STRING) {
-            zend_type_error("each header array must contain string 'name' and 'value'");
-            return FAILURE;
-        }
-
-        nva[i].name = (uint8_t *)Z_STRVAL_P(name);
-        nva[i].namelen = Z_STRLEN_P(name);
-        nva[i].value = (uint8_t *)Z_STRVAL_P(value);
-        nva[i].valuelen = Z_STRLEN_P(value);
-        nva[i].flags = NGHTTP2_NV_FLAG_NONE;
-        i++;
-    } ZEND_HASH_FOREACH_END();
-
-    return SUCCESS;
-}
-
 ZEND_METHOD(Nghttp2_Client, request)
 {
     zend_string *path;
     zval *headers = NULL;
+    zval normalized_headers;
     nghttp2_client_object *intern = Z_NGHTTP2_CLIENT_OBJ_P(ZEND_THIS);
     uint8_t rbuf[16 * 1024];
     zend_string *authority;
     uint32_t extra_headers = 0;
     uint32_t nvlen;
     nghttp2_nv *nva;
+    nghttp2_nv *custom_nva = NULL;
+    size_t custom_nvlen = 0;
     int rv;
 
     ZEND_PARSE_PARAMETERS_START(1, 2)
@@ -506,6 +461,8 @@ ZEND_METHOD(Nghttp2_Client, request)
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY(headers)
     ZEND_PARSE_PARAMETERS_END();
+
+    ZVAL_UNDEF(&normalized_headers);
 
     if (intern->session == NULL || intern->ssl == NULL) {
         nghttp2_throw_client_exception("connection is closed", NGHTTP2_ERR_INVALID_STATE);
@@ -518,7 +475,16 @@ ZEND_METHOD(Nghttp2_Client, request)
 
     authority = strpprintf(0, "%s:%ld", ZSTR_VAL(intern->host), intern->port);
     if (headers != NULL) {
-        extra_headers = zend_hash_num_elements(Z_ARRVAL_P(headers));
+        if (nghttp2_headers_normalize(headers, &normalized_headers, NGHTTP2_HEADERS_NORMALIZE_ALLOW_ASSOC) != SUCCESS) {
+            zend_string_release(authority);
+            RETURN_THROWS();
+        }
+        if (nghttp2_headers_build_nv_array(&normalized_headers, &custom_nva, &custom_nvlen) != SUCCESS) {
+            zend_string_release(authority);
+            zval_ptr_dtor(&normalized_headers);
+            RETURN_THROWS();
+        }
+        extra_headers = (uint32_t)custom_nvlen;
     }
 
     nvlen = 6 + extra_headers;
@@ -560,10 +526,13 @@ ZEND_METHOD(Nghttp2_Client, request)
     nva[5].valuelen = sizeof("*/*") - 1;
     nva[5].flags = NGHTTP2_NV_FLAG_NONE;
 
-    if (headers != NULL && nghttp2_client_append_custom_headers(nva, 6, headers) != SUCCESS) {
-        zend_string_release(authority);
-        efree(nva);
-        RETURN_THROWS();
+    if (custom_nva != NULL) {
+        memcpy(&nva[6], custom_nva, custom_nvlen * sizeof(*custom_nva));
+        efree(custom_nva);
+        custom_nva = NULL;
+    }
+    if (Z_TYPE(normalized_headers) != IS_UNDEF) {
+        zval_ptr_dtor(&normalized_headers);
     }
 
     nghttp2_client_reset_response(intern);

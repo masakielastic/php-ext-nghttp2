@@ -4,6 +4,9 @@
 #include <php.h>
 #include <nghttp2/nghttp2.h>
 
+#define NGHTTP2_HEADERS_NORMALIZE_ALLOW_ASSOC 0x01
+#define NGHTTP2_HEADERS_NORMALIZE_FILTER_RESPONSE_RESERVED 0x02
+
 extern zend_module_entry nghttp2_module_entry;
 #define phpext_nghttp2_ptr &nghttp2_module_entry
 
@@ -26,5 +29,9 @@ void nghttp2_throw_hpack_exception(const char *message, int error_code);
 void nghttp2_throw_client_exception(const char *message, int error_code);
 void nghttp2_throw_server_exception(const char *message, int error_code);
 void nghttp2_throw_session_exception(const char *message, int error_code);
+
+zend_bool nghttp2_headers_is_reserved_response_name(const zend_string *name);
+int nghttp2_headers_normalize(zval *headers, zval *normalized, uint32_t flags);
+int nghttp2_headers_build_nv_array(zval *headers, nghttp2_nv **nva_out, size_t *nvlen_out);
 
 #endif

@@ -231,40 +231,27 @@ static ssize_t nghttp2_server_data_read_cb(
     return (ssize_t)ncopy;
 }
 
-static int nghttp2_server_header_is_reserved(const char *name, size_t namelen)
-{
-    if (namelen == sizeof(":status") - 1 && strncasecmp(name, ":status", sizeof(":status") - 1) == 0) {
-        return 1;
-    }
-    if (namelen == sizeof("content-length") - 1 && strncasecmp(name, "content-length", sizeof("content-length") - 1) == 0) {
-        return 1;
-    }
-
-    return 0;
-}
-
 static int nghttp2_server_submit_response(
     nghttp2_server_object *intern,
     nghttp2_session *session,
     int32_t stream_id
 )
 {
-    HashTable *headers_ht = Z_ARRVAL(intern->response_headers);
     char content_length[32];
     char status[4];
     nghttp2_nv *hdrs;
+    nghttp2_nv *user_hdrs = NULL;
     nghttp2_data_provider dp;
     nghttp2_server_stream_body *body;
-    uint32_t user_header_count;
+    size_t user_header_count = 0;
     uint32_t hdr_count = 2;
-    zval *entry;
-    zend_string *key;
-    zend_ulong index;
-    uint32_t i;
     int rv;
 
-    user_header_count = zend_hash_num_elements(headers_ht);
-    hdrs = ecalloc((size_t)user_header_count + 2, sizeof(*hdrs));
+    if (nghttp2_headers_build_nv_array(&intern->response_headers, &user_hdrs, &user_header_count) != SUCCESS) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+
+    hdrs = ecalloc(user_header_count + 2, sizeof(*hdrs));
 
     body = ecalloc(1, sizeof(*body));
     body->len = ZSTR_LEN(intern->response_body);
@@ -291,45 +278,12 @@ static int nghttp2_server_submit_response(
     hdrs[1].valuelen = (uint16_t)strlen(content_length);
     hdrs[1].flags = NGHTTP2_NV_FLAG_NONE;
 
-    ZEND_HASH_FOREACH_KEY_VAL(headers_ht, index, key, entry) {
-        zend_string *name = NULL;
-        zend_string *value = NULL;
-        zval *name_zv;
-        zval *value_zv;
-
-        if (key != NULL) {
-            if (Z_TYPE_P(entry) != IS_STRING) {
-                continue;
-            }
-            name = key;
-            value = Z_STR_P(entry);
-        } else {
-            if (Z_TYPE_P(entry) != IS_ARRAY) {
-                continue;
-            }
-            name_zv = zend_hash_str_find(Z_ARRVAL_P(entry), "name", sizeof("name") - 1);
-            value_zv = zend_hash_str_find(Z_ARRVAL_P(entry), "value", sizeof("value") - 1);
-            if (name_zv == NULL || value_zv == NULL || Z_TYPE_P(name_zv) != IS_STRING || Z_TYPE_P(value_zv) != IS_STRING) {
-                continue;
-            }
-            name = Z_STR_P(name_zv);
-            value = Z_STR_P(value_zv);
-        }
-
-        if (nghttp2_server_header_is_reserved(ZSTR_VAL(name), ZSTR_LEN(name))) {
-            continue;
-        }
-        if (hdr_count >= user_header_count + 2) {
-            break;
-        }
-
-        i = hdr_count++;
-        hdrs[i].name = (uint8_t *)ZSTR_VAL(name);
-        hdrs[i].namelen = ZSTR_LEN(name);
-        hdrs[i].value = (uint8_t *)ZSTR_VAL(value);
-        hdrs[i].valuelen = ZSTR_LEN(value);
-        hdrs[i].flags = NGHTTP2_NV_FLAG_NONE;
-    } ZEND_HASH_FOREACH_END();
+    if (user_hdrs != NULL) {
+        memcpy(&hdrs[2], user_hdrs, user_header_count * sizeof(*user_hdrs));
+        hdr_count += (uint32_t)user_header_count;
+        efree(user_hdrs);
+        user_hdrs = NULL;
+    }
 
     memset(&dp, 0, sizeof(dp));
     dp.source.ptr = body;
@@ -341,6 +295,9 @@ static int nghttp2_server_submit_response(
         nghttp2_session_set_stream_user_data(session, stream_id, NULL);
         efree(body->data);
         efree(body);
+        if (user_hdrs != NULL) {
+            efree(user_hdrs);
+        }
         return rv;
     }
 
@@ -648,9 +605,6 @@ ZEND_METHOD(Nghttp2_Server, setResponse)
     zend_string *body;
     nghttp2_server_object *intern = Z_NGHTTP2_SERVER_OBJ_P(ZEND_THIS);
     zval normalized_headers;
-    zval *entry;
-    zend_string *key;
-    zend_ulong index;
 
     ZEND_PARSE_PARAMETERS_START(3, 3)
         Z_PARAM_LONG(status)
@@ -663,54 +617,13 @@ ZEND_METHOD(Nghttp2_Server, setResponse)
         RETURN_THROWS();
     }
 
-    array_init(&normalized_headers);
-    ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(headers), index, key, entry) {
-        zval pair;
-        zval name_zv;
-        zval value_zv;
-
-        if (key != NULL) {
-            if (Z_TYPE_P(entry) != IS_STRING) {
-                zval_ptr_dtor(&normalized_headers);
-                zend_type_error("header value must be string");
-                RETURN_THROWS();
-            }
-            if (nghttp2_server_header_is_reserved(ZSTR_VAL(key), ZSTR_LEN(key))) {
-                continue;
-            }
-            array_init(&pair);
-            ZVAL_STR_COPY(&name_zv, key);
-            ZVAL_STR_COPY(&value_zv, Z_STR_P(entry));
-            zend_hash_str_update(Z_ARRVAL(pair), "name", sizeof("name") - 1, &name_zv);
-            zend_hash_str_update(Z_ARRVAL(pair), "value", sizeof("value") - 1, &value_zv);
-            add_next_index_zval(&normalized_headers, &pair);
-            continue;
-        }
-
-        if (Z_TYPE_P(entry) != IS_ARRAY) {
-            zval_ptr_dtor(&normalized_headers);
-            zend_type_error("each header must be string value or array{name, value}");
-            RETURN_THROWS();
-        }
-        {
-            zval *name = zend_hash_str_find(Z_ARRVAL_P(entry), "name", sizeof("name") - 1);
-            zval *value = zend_hash_str_find(Z_ARRVAL_P(entry), "value", sizeof("value") - 1);
-            if (name == NULL || value == NULL || Z_TYPE_P(name) != IS_STRING || Z_TYPE_P(value) != IS_STRING) {
-                zval_ptr_dtor(&normalized_headers);
-                zend_type_error("each header array must contain string 'name' and 'value'");
-                RETURN_THROWS();
-            }
-            if (nghttp2_server_header_is_reserved(Z_STRVAL_P(name), Z_STRLEN_P(name))) {
-                continue;
-            }
-            array_init(&pair);
-            ZVAL_STR_COPY(&name_zv, Z_STR_P(name));
-            ZVAL_STR_COPY(&value_zv, Z_STR_P(value));
-            zend_hash_str_update(Z_ARRVAL(pair), "name", sizeof("name") - 1, &name_zv);
-            zend_hash_str_update(Z_ARRVAL(pair), "value", sizeof("value") - 1, &value_zv);
-            add_next_index_zval(&normalized_headers, &pair);
-        }
-    } ZEND_HASH_FOREACH_END();
+    if (nghttp2_headers_normalize(
+            headers,
+            &normalized_headers,
+            NGHTTP2_HEADERS_NORMALIZE_ALLOW_ASSOC | NGHTTP2_HEADERS_NORMALIZE_FILTER_RESPONSE_RESERVED
+        ) != SUCCESS) {
+        RETURN_THROWS();
+    }
 
     intern->response_status = status;
     if (Z_TYPE(intern->response_headers) != IS_UNDEF) {

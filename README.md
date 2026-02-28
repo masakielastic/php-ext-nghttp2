@@ -14,6 +14,8 @@ stateful interface to HTTP/2 primitives including:
 The design focuses on low-level experimentation,
 blocking APIs, and educational use.
 
+See [CHANGELOG.md](/home/masakielastic/php-ext-nghttp2/CHANGELOG.md) for recent changes.
+
 ---
 
 ## Features (Current)

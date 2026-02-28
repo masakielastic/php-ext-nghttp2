@@ -9,9 +9,18 @@ typedef struct _nghttp2_session_stream_state {
     zval headers;
     zend_bool collecting_headers;
     uint8_t headers_category;
-    zend_string *outgoing_data;
-    size_t outgoing_data_offset;
+    struct _nghttp2_session_outgoing_chunk *outgoing_head;
+    struct _nghttp2_session_outgoing_chunk *outgoing_tail;
+    zend_bool outgoing_submission_started;
+    zend_bool outgoing_deferred;
 } nghttp2_session_stream_state;
+
+typedef struct _nghttp2_session_outgoing_chunk {
+    zend_string *data;
+    size_t offset;
+    zend_bool end_stream;
+    struct _nghttp2_session_outgoing_chunk *next;
+} nghttp2_session_outgoing_chunk;
 
 typedef struct _nghttp2_session_object {
     nghttp2_session *session;
@@ -61,12 +70,22 @@ static void nghttp2_session_stream_state_reset_headers(nghttp2_session_stream_st
 
 static void nghttp2_session_stream_state_reset_outgoing_data(nghttp2_session_stream_state *state)
 {
-    if (state->outgoing_data != NULL) {
-        zend_string_release(state->outgoing_data);
-        state->outgoing_data = NULL;
+    nghttp2_session_outgoing_chunk *chunk = state->outgoing_head;
+    nghttp2_session_outgoing_chunk *next;
+
+    while (chunk != NULL) {
+        next = chunk->next;
+        if (chunk->data != NULL) {
+            zend_string_release(chunk->data);
+        }
+        efree(chunk);
+        chunk = next;
     }
 
-    state->outgoing_data_offset = 0;
+    state->outgoing_head = NULL;
+    state->outgoing_tail = NULL;
+    state->outgoing_submission_started = 0;
+    state->outgoing_deferred = 0;
 }
 
 static void nghttp2_session_stream_state_free(nghttp2_session_stream_state *state)
@@ -120,8 +139,10 @@ static nghttp2_session_stream_state *nghttp2_session_stream_state_get(
     ZVAL_UNDEF(&state->headers);
     state->collecting_headers = 0;
     state->headers_category = NGHTTP2_HCAT_HEADERS;
-    state->outgoing_data = NULL;
-    state->outgoing_data_offset = 0;
+    state->outgoing_head = NULL;
+    state->outgoing_tail = NULL;
+    state->outgoing_submission_started = 0;
+    state->outgoing_deferred = 0;
 
     zend_hash_index_add_ptr(&intern->stream_states, (zend_ulong)stream_id, state);
     return state;
@@ -453,6 +474,49 @@ static int nghttp2_session_on_data_chunk_recv_cb(
     return 0;
 }
 
+static int nghttp2_session_stream_state_queue_outgoing_chunk(
+    nghttp2_session_stream_state *state,
+    zend_string *data,
+    zend_bool end_stream
+)
+{
+    nghttp2_session_outgoing_chunk *chunk;
+
+    chunk = ecalloc(1, sizeof(*chunk));
+    chunk->data = zend_string_copy(data);
+    chunk->offset = 0;
+    chunk->end_stream = end_stream;
+    chunk->next = NULL;
+
+    if (state->outgoing_tail != NULL) {
+        state->outgoing_tail->next = chunk;
+    } else {
+        state->outgoing_head = chunk;
+    }
+    state->outgoing_tail = chunk;
+
+    return SUCCESS;
+}
+
+static void nghttp2_session_stream_state_pop_outgoing_head(nghttp2_session_stream_state *state)
+{
+    nghttp2_session_outgoing_chunk *chunk = state->outgoing_head;
+
+    if (chunk == NULL) {
+        return;
+    }
+
+    state->outgoing_head = chunk->next;
+    if (state->outgoing_head == NULL) {
+        state->outgoing_tail = NULL;
+    }
+
+    if (chunk->data != NULL) {
+        zend_string_release(chunk->data);
+    }
+    efree(chunk);
+}
+
 static int nghttp2_session_on_stream_close_cb(
     nghttp2_session *session,
     int32_t stream_id,
@@ -480,31 +544,59 @@ static ssize_t nghttp2_session_data_read_cb(
 )
 {
     nghttp2_session_stream_state *state = (nghttp2_session_stream_state *)source->ptr;
-    size_t remain;
-    size_t ncopy;
+    size_t total = 0;
+    nghttp2_session_outgoing_chunk *chunk;
 
     (void)session;
     (void)stream_id;
     (void)user_data;
 
-    if (state == NULL || state->outgoing_data == NULL) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        return 0;
+    if (state == NULL) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
 
-    remain = ZSTR_LEN(state->outgoing_data) - state->outgoing_data_offset;
-    ncopy = remain < length ? remain : length;
-    if (ncopy > 0) {
-        memcpy(buf, ZSTR_VAL(state->outgoing_data) + state->outgoing_data_offset, ncopy);
-        state->outgoing_data_offset += ncopy;
+    state->outgoing_deferred = 0;
+
+    while (total < length) {
+        size_t remain;
+        size_t ncopy;
+
+        chunk = state->outgoing_head;
+        if (chunk == NULL) {
+            if (total == 0) {
+                state->outgoing_deferred = 1;
+                return NGHTTP2_ERR_DEFERRED;
+            }
+            break;
+        }
+
+        remain = ZSTR_LEN(chunk->data) - chunk->offset;
+        if (remain == 0) {
+            if (chunk->end_stream) {
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                nghttp2_session_stream_state_pop_outgoing_head(state);
+                return (ssize_t)total;
+            }
+            nghttp2_session_stream_state_pop_outgoing_head(state);
+            continue;
+        }
+
+        ncopy = remain < (length - total) ? remain : (length - total);
+        memcpy(buf + total, ZSTR_VAL(chunk->data) + chunk->offset, ncopy);
+        chunk->offset += ncopy;
+        total += ncopy;
+
+        if (chunk->offset >= ZSTR_LEN(chunk->data)) {
+            zend_bool end_stream = chunk->end_stream;
+            nghttp2_session_stream_state_pop_outgoing_head(state);
+            if (end_stream) {
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                break;
+            }
+        }
     }
 
-    if (state->outgoing_data_offset >= ZSTR_LEN(state->outgoing_data)) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        nghttp2_session_stream_state_reset_outgoing_data(state);
-    }
-
-    return (ssize_t)ncopy;
+    return (ssize_t)total;
 }
 
 static int nghttp2_session_flush_outbound(nghttp2_session_object *intern)
@@ -989,16 +1081,32 @@ ZEND_METHOD(Nghttp2_Session, submitRequest)
     if (nghttp2_session_require_open(intern) != SUCCESS) {
         RETURN_THROWS();
     }
-    if (!end_stream) {
-        nghttp2_throw_session_exception("request bodies are not implemented yet", NGHTTP2_ERR_INVALID_ARGUMENT);
-        RETURN_THROWS();
-    }
-
     if (nghttp2_session_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
         RETURN_THROWS();
     }
 
-    stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, NULL, NULL);
+    state = nghttp2_session_stream_state_get(intern, 0, 1);
+    if (state == NULL) {
+        if (nva != NULL) {
+            efree(nva);
+        }
+        nghttp2_throw_session_exception("failed to allocate stream state", NGHTTP2_ERR_NOMEM);
+        RETURN_THROWS();
+    }
+
+    if (!end_stream) {
+        nghttp2_data_provider provider;
+
+        memset(&provider, 0, sizeof(provider));
+        provider.source.ptr = state;
+        provider.read_callback = nghttp2_session_data_read_cb;
+
+        stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, &provider, state);
+        state->outgoing_submission_started = 1;
+        state->outgoing_deferred = 0;
+    } else {
+        stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, NULL, state);
+    }
     if (nva != NULL) {
         efree(nva);
     }
@@ -1008,8 +1116,10 @@ ZEND_METHOD(Nghttp2_Session, submitRequest)
         RETURN_THROWS();
     }
 
-    state = nghttp2_session_stream_state_get(intern, stream_id, 1);
-    if (state != NULL) {
+    if (stream_id != 0 && state != NULL) {
+        zend_hash_index_del(&intern->stream_states, 0);
+        state->stream_id = stream_id;
+        zend_hash_index_add_ptr(&intern->stream_states, (zend_ulong)stream_id, state);
         nghttp2_session_set_stream_user_data(intern->session, stream_id, state);
     }
 
@@ -1096,28 +1206,40 @@ ZEND_METHOD(Nghttp2_Session, submitData)
         nghttp2_throw_session_exception("stream state not found", NGHTTP2_ERR_INVALID_STATE);
         RETURN_THROWS();
     }
-    if (state->outgoing_data != NULL) {
-        nghttp2_throw_session_exception("stream already has pending outbound data", NGHTTP2_ERR_INVALID_STATE);
+    if (state->outgoing_tail != NULL && state->outgoing_tail->end_stream) {
+        nghttp2_throw_session_exception("stream already has a final outbound chunk queued", NGHTTP2_ERR_INVALID_STATE);
         RETURN_THROWS();
     }
 
-    state->outgoing_data = zend_string_copy(data);
-    state->outgoing_data_offset = 0;
-
-    memset(&provider, 0, sizeof(provider));
-    provider.source.ptr = state;
-    provider.read_callback = nghttp2_session_data_read_cb;
-
-    rv = nghttp2_submit_data(
-        intern->session,
-        end_stream ? NGHTTP2_FLAG_END_STREAM : NGHTTP2_FLAG_NONE,
-        (int32_t)stream_id,
-        &provider
-    );
-    if (rv != 0) {
-        nghttp2_session_stream_state_reset_outgoing_data(state);
-        nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+    if (nghttp2_session_stream_state_queue_outgoing_chunk(state, data, end_stream) != SUCCESS) {
+        nghttp2_throw_session_exception("failed to queue outbound data", NGHTTP2_ERR_NOMEM);
         RETURN_THROWS();
+    }
+
+    if (!state->outgoing_submission_started) {
+        memset(&provider, 0, sizeof(provider));
+        provider.source.ptr = state;
+        provider.read_callback = nghttp2_session_data_read_cb;
+
+        rv = nghttp2_submit_data(
+            intern->session,
+            NGHTTP2_FLAG_END_STREAM,
+            (int32_t)stream_id,
+            &provider
+        );
+        if (rv != 0) {
+            nghttp2_session_stream_state_pop_outgoing_head(state);
+            nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+            RETURN_THROWS();
+        }
+        state->outgoing_submission_started = 1;
+        state->outgoing_deferred = 0;
+    } else if (state->outgoing_deferred) {
+        rv = nghttp2_session_resume_data(intern->session, (int32_t)stream_id);
+        if (rv != 0) {
+            nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+            RETURN_THROWS();
+        }
     }
 
     if (nghttp2_session_flush_outbound(intern) != SUCCESS) {

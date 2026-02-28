@@ -40,6 +40,9 @@ int nghttp2_session_receive_bytes(zval *zv, const uint8_t *bytes, size_t len, ss
 zend_string *nghttp2_session_pop_outbound_string(zval *zv);
 void nghttp2_session_pop_events_array(zval *zv, zval *events_out);
 int nghttp2_session_submit_request_headers(zval *zv, zval *headers, zend_bool end_stream, int32_t *stream_id_out);
+int nghttp2_session_submit_response_headers(zval *zv, zend_long stream_id, zval *headers, zend_bool end_stream);
+int nghttp2_session_submit_data_string(zval *zv, zend_long stream_id, zend_string *data, zend_bool end_stream);
+zend_bool nghttp2_session_stream_has_inbound_end(zval *zv, int32_t stream_id);
 void nghttp2_session_close_zval(zval *zv);
 
 #endif

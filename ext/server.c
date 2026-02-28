@@ -1,5 +1,7 @@
 #include "php_nghttp2.h"
 
+#include <Zend/zend_exceptions.h>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -34,14 +36,11 @@ typedef struct _nghttp2_server_object {
 typedef struct _nghttp2_server_conn_ctx {
     int fd;
     SSL *ssl;
+    zval session_obj;
+    HashTable responded_streams;
+    zend_bool responded_streams_initialized;
     nghttp2_server_object *server;
 } nghttp2_server_conn_ctx;
-
-typedef struct _nghttp2_server_stream_body {
-    uint8_t *data;
-    size_t len;
-    size_t off;
-} nghttp2_server_stream_body;
 
 zend_class_entry *nghttp2_ce_server;
 static zend_object_handlers nghttp2_server_object_handlers;
@@ -67,6 +66,8 @@ static void nghttp2_server_close_listener(nghttp2_server_object *intern)
 
 static void nghttp2_server_set_default_response(nghttp2_server_object *intern)
 {
+    zval normalized_headers;
+
     if (Z_TYPE(intern->response_headers) != IS_UNDEF) {
         zval_ptr_dtor(&intern->response_headers);
     }
@@ -75,9 +76,53 @@ static void nghttp2_server_set_default_response(nghttp2_server_object *intern)
     }
 
     intern->response_status = 200;
-    array_init(&intern->response_headers);
-    add_assoc_string(&intern->response_headers, "content-type", "text/plain; charset=utf-8");
+    array_init(&normalized_headers);
+    {
+        zval pair;
+        array_init(&pair);
+        add_assoc_string(&pair, "name", "content-type");
+        add_assoc_string(&pair, "value", "text/plain; charset=utf-8");
+        add_next_index_zval(&normalized_headers, &pair);
+    }
+    ZVAL_COPY_VALUE(&intern->response_headers, &normalized_headers);
     intern->response_body = zend_string_init("Hello HTTP/2 over TLS\n", sizeof("Hello HTTP/2 over TLS\n") - 1, 0);
+}
+
+static void nghttp2_server_response_tracker_init(nghttp2_server_conn_ctx *conn)
+{
+    zend_hash_init(&conn->responded_streams, 8, NULL, NULL, 0);
+    conn->responded_streams_initialized = 1;
+}
+
+static void nghttp2_server_response_tracker_destroy(nghttp2_server_conn_ctx *conn)
+{
+    if (!conn->responded_streams_initialized) {
+        return;
+    }
+
+    zend_hash_destroy(&conn->responded_streams);
+    conn->responded_streams_initialized = 0;
+}
+
+static zend_bool nghttp2_server_has_responded(nghttp2_server_conn_ctx *conn, int32_t stream_id)
+{
+    if (!conn->responded_streams_initialized) {
+        return 0;
+    }
+
+    return zend_hash_index_exists(&conn->responded_streams, (zend_ulong) stream_id);
+}
+
+static void nghttp2_server_mark_responded(nghttp2_server_conn_ctx *conn, int32_t stream_id)
+{
+    zval marker;
+
+    if (!conn->responded_streams_initialized) {
+        return;
+    }
+
+    ZVAL_TRUE(&marker);
+    zend_hash_index_update(&conn->responded_streams, (zend_ulong) stream_id, &marker);
 }
 
 static int nghttp2_server_alpn_select_cb(
@@ -171,229 +216,143 @@ static int nghttp2_server_create_listen_socket(const char *ip, zend_long port)
     return fd;
 }
 
-static ssize_t nghttp2_server_send_cb(
-    nghttp2_session *session,
-    const uint8_t *data,
-    size_t length,
-    int flags,
-    void *user_data
-)
+static int nghttp2_server_ssl_write_all(SSL *ssl, zend_string *data)
 {
-    nghttp2_server_conn_ctx *conn = (nghttp2_server_conn_ctx *)user_data;
     size_t off = 0;
 
-    (void)session;
-    (void)flags;
-
-    while (off < length) {
-        int n = SSL_write(conn->ssl, data + off, (int)(length - off));
+    while (off < ZSTR_LEN(data)) {
+        int n = SSL_write(ssl, ZSTR_VAL(data) + off, (int)(ZSTR_LEN(data) - off));
         if (n <= 0) {
-            int err = SSL_get_error(conn->ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                return NGHTTP2_ERR_WOULDBLOCK;
-            }
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
+            return FAILURE;
         }
         off += (size_t)n;
     }
 
-    return (ssize_t)length;
+    return SUCCESS;
 }
 
-static ssize_t nghttp2_server_data_read_cb(
-    nghttp2_session *session,
-    int32_t stream_id,
-    uint8_t *buf,
-    size_t length,
-    uint32_t *data_flags,
-    nghttp2_data_source *source,
-    void *user_data
-)
+static int nghttp2_server_flush_session_outbound(nghttp2_server_conn_ctx *conn)
 {
-    nghttp2_server_stream_body *body = (nghttp2_server_stream_body *)source->ptr;
-    size_t remain;
-    size_t ncopy;
+    zend_string *outbound;
+    int result = SUCCESS;
 
-    (void)session;
-    (void)stream_id;
-    (void)user_data;
-
-    remain = body->len - body->off;
-    ncopy = remain < length ? remain : length;
-    if (ncopy > 0) {
-        memcpy(buf, body->data + body->off, ncopy);
-        body->off += ncopy;
+    outbound = nghttp2_session_pop_outbound_string(&conn->session_obj);
+    if (ZSTR_LEN(outbound) > 0) {
+        result = nghttp2_server_ssl_write_all(conn->ssl, outbound);
     }
-    if (body->off >= body->len) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    }
+    zend_string_release(outbound);
 
-    return (ssize_t)ncopy;
+    return result;
 }
 
-static int nghttp2_server_submit_response(
-    nghttp2_server_object *intern,
-    nghttp2_session *session,
-    int32_t stream_id
-)
+static int nghttp2_server_submit_response(nghttp2_server_conn_ctx *conn, int32_t stream_id)
 {
-    char content_length[32];
+    zval headers;
+    zval *header;
     char status[4];
-    nghttp2_nv *hdrs;
-    nghttp2_nv *user_hdrs = NULL;
-    nghttp2_data_provider dp;
-    nghttp2_server_stream_body *body;
-    size_t user_header_count = 0;
-    uint32_t hdr_count = 2;
-    int rv;
+    char content_length[32];
+    int result = SUCCESS;
 
-    if (nghttp2_headers_build_nv_array(&intern->response_headers, &user_hdrs, &user_header_count) != SUCCESS) {
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    array_init(&headers);
+
+    snprintf(status, sizeof(status), "%03ld", conn->server->response_status);
+    snprintf(content_length, sizeof(content_length), "%zu", ZSTR_LEN(conn->server->response_body));
+
+    {
+        zval pair;
+        array_init(&pair);
+        add_assoc_string(&pair, "name", ":status");
+        add_assoc_string(&pair, "value", status);
+        add_next_index_zval(&headers, &pair);
     }
 
-    hdrs = ecalloc(user_header_count + 2, sizeof(*hdrs));
-
-    body = ecalloc(1, sizeof(*body));
-    body->len = ZSTR_LEN(intern->response_body);
-    body->data = emalloc(body->len > 0 ? body->len : 1);
-    if (body->len > 0) {
-        memcpy(body->data, ZSTR_VAL(intern->response_body), body->len);
-    }
-    body->off = 0;
-
-    nghttp2_session_set_stream_user_data(session, stream_id, body);
-
-    snprintf(content_length, sizeof(content_length), "%zu", body->len);
-    snprintf(status, sizeof(status), "%03ld", intern->response_status);
-
-    hdrs[0].name = (uint8_t *)":status";
-    hdrs[0].value = (uint8_t *)status;
-    hdrs[0].namelen = sizeof(":status") - 1;
-    hdrs[0].valuelen = sizeof(status) - 1;
-    hdrs[0].flags = NGHTTP2_NV_FLAG_NONE;
-
-    hdrs[1].name = (uint8_t *)"content-length";
-    hdrs[1].value = (uint8_t *)content_length;
-    hdrs[1].namelen = sizeof("content-length") - 1;
-    hdrs[1].valuelen = (uint16_t)strlen(content_length);
-    hdrs[1].flags = NGHTTP2_NV_FLAG_NONE;
-
-    if (user_hdrs != NULL) {
-        memcpy(&hdrs[2], user_hdrs, user_header_count * sizeof(*user_hdrs));
-        hdr_count += (uint32_t)user_header_count;
-        efree(user_hdrs);
-        user_hdrs = NULL;
+    {
+        zval pair;
+        array_init(&pair);
+        add_assoc_string(&pair, "name", "content-length");
+        add_assoc_string(&pair, "value", content_length);
+        add_next_index_zval(&headers, &pair);
     }
 
-    memset(&dp, 0, sizeof(dp));
-    dp.source.ptr = body;
-    dp.read_callback = nghttp2_server_data_read_cb;
-
-    rv = nghttp2_submit_response(session, stream_id, hdrs, hdr_count, &dp);
-    efree(hdrs);
-    if (rv != 0) {
-        nghttp2_session_set_stream_user_data(session, stream_id, NULL);
-        efree(body->data);
-        efree(body);
-        if (user_hdrs != NULL) {
-            efree(user_hdrs);
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL(conn->server->response_headers), header) {
+        if (Z_TYPE_P(header) != IS_ARRAY) {
+            continue;
         }
-        return rv;
+        Z_TRY_ADDREF_P(header);
+        add_next_index_zval(&headers, header);
+    } ZEND_HASH_FOREACH_END();
+
+    if (nghttp2_session_submit_response_headers(&conn->session_obj, stream_id, &headers, 0) != SUCCESS) {
+        result = FAILURE;
+    } else if (nghttp2_session_submit_data_string(&conn->session_obj, stream_id, conn->server->response_body, 1) != SUCCESS) {
+        result = FAILURE;
+    } else {
+        nghttp2_server_mark_responded(conn, stream_id);
     }
 
-    return 0;
+    zval_ptr_dtor(&headers);
+    return result;
 }
 
-static int nghttp2_server_on_frame_recv_cb(
-    nghttp2_session *session,
-    const nghttp2_frame *frame,
-    void *user_data
-)
+static void nghttp2_server_process_session_events(nghttp2_server_conn_ctx *conn)
 {
-    nghttp2_server_conn_ctx *conn = (nghttp2_server_conn_ctx *)user_data;
-    int rv;
+    zval events;
+    zval *event;
 
-    if (frame->hd.stream_id <= 0) {
-        return 0;
-    }
+    nghttp2_session_pop_events_array(&conn->session_obj, &events);
 
-    if (frame->hd.type == NGHTTP2_HEADERS &&
-        frame->headers.cat == NGHTTP2_HCAT_REQUEST &&
-        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-        rv = nghttp2_server_submit_response(conn->server, session, frame->hd.stream_id);
-        if (rv != 0) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL(events), event) {
+        zval *type;
+        zval *category;
+        zval *stream_id;
+
+        if (Z_TYPE_P(event) != IS_ARRAY) {
+            continue;
         }
-    }
 
-    if (frame->hd.type == NGHTTP2_DATA &&
-        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) &&
-        nghttp2_session_get_stream_user_data(session, frame->hd.stream_id) == NULL) {
-        rv = nghttp2_server_submit_response(conn->server, session, frame->hd.stream_id);
-        if (rv != 0) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        type = zend_hash_str_find(Z_ARRVAL_P(event), "type", sizeof("type") - 1);
+        category = zend_hash_str_find(Z_ARRVAL_P(event), "category", sizeof("category") - 1);
+        stream_id = zend_hash_str_find(Z_ARRVAL_P(event), "streamId", sizeof("streamId") - 1);
+
+        if (type == NULL || Z_TYPE_P(type) != IS_STRING || stream_id == NULL) {
+            continue;
         }
-    }
 
-    return 0;
-}
+        if (nghttp2_server_has_responded(conn, (int32_t) zval_get_long(stream_id))) {
+            continue;
+        }
 
-static int nghttp2_server_on_stream_close_cb(
-    nghttp2_session *session,
-    int32_t stream_id,
-    uint32_t error_code,
-    void *user_data
-)
-{
-    nghttp2_server_stream_body *body;
+        if (zend_string_equals_literal(Z_STR_P(type), "headers")) {
+            zval *end_stream;
 
-    (void)error_code;
-    (void)user_data;
+            if (category == NULL || Z_TYPE_P(category) != IS_STRING || !zend_string_equals_literal(Z_STR_P(category), "request")) {
+                continue;
+            }
 
-    body = (nghttp2_server_stream_body *)nghttp2_session_get_stream_user_data(session, stream_id);
-    if (body != NULL) {
-        efree(body->data);
-        efree(body);
-        nghttp2_session_set_stream_user_data(session, stream_id, NULL);
-    }
+            end_stream = zend_hash_str_find(Z_ARRVAL_P(event), "endStream", sizeof("endStream") - 1);
+            if ((end_stream != NULL && zend_is_true(end_stream)) ||
+                nghttp2_session_stream_has_inbound_end(&conn->session_obj, (int32_t) zval_get_long(stream_id))) {
+                if (nghttp2_server_submit_response(conn, (int32_t) zval_get_long(stream_id)) != SUCCESS) {
+                    zval_ptr_dtor(&events);
+                    return;
+                }
+            }
+        } else if (zend_string_equals_literal(Z_STR_P(type), "data")) {
+            if (nghttp2_session_stream_has_inbound_end(&conn->session_obj, (int32_t) zval_get_long(stream_id))) {
+                if (nghttp2_server_submit_response(conn, (int32_t) zval_get_long(stream_id)) != SUCCESS) {
+                    zval_ptr_dtor(&events);
+                    return;
+                }
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
 
-    return 0;
-}
-
-static nghttp2_session *nghttp2_server_setup_session(nghttp2_server_conn_ctx *conn)
-{
-    nghttp2_session_callbacks *cbs = NULL;
-    nghttp2_session *session = NULL;
-    int rv;
-
-    rv = nghttp2_session_callbacks_new(&cbs);
-    if (rv != 0) {
-        return NULL;
-    }
-
-    nghttp2_session_callbacks_set_send_callback(cbs, nghttp2_server_send_cb);
-    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, nghttp2_server_on_frame_recv_cb);
-    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, nghttp2_server_on_stream_close_cb);
-
-    rv = nghttp2_session_server_new(&session, cbs, conn);
-    nghttp2_session_callbacks_del(cbs);
-    if (rv != 0) {
-        return NULL;
-    }
-
-    rv = nghttp2_submit_default_settings(session);
-    if (rv != 0) {
-        nghttp2_session_del(session);
-        return NULL;
-    }
-
-    return session;
+    zval_ptr_dtor(&events);
 }
 
 static void nghttp2_server_handle_connection(nghttp2_server_object *intern, int client_fd)
 {
     nghttp2_server_conn_ctx conn;
-    nghttp2_session *session;
     uint8_t buf[16 * 1024];
     const unsigned char *alpn = NULL;
     unsigned int alpn_len = 0;
@@ -402,8 +361,11 @@ static void nghttp2_server_handle_connection(nghttp2_server_object *intern, int 
     memset(&conn, 0, sizeof(conn));
     conn.fd = client_fd;
     conn.server = intern;
+    ZVAL_UNDEF(&conn.session_obj);
+    nghttp2_server_response_tracker_init(&conn);
     conn.ssl = SSL_new(intern->ssl_ctx);
     if (conn.ssl == NULL) {
+        nghttp2_server_response_tracker_destroy(&conn);
         close(client_fd);
         return;
     }
@@ -411,6 +373,7 @@ static void nghttp2_server_handle_connection(nghttp2_server_object *intern, int 
 
     rv = SSL_accept(conn.ssl);
     if (rv != 1) {
+        nghttp2_server_response_tracker_destroy(&conn);
         SSL_free(conn.ssl);
         close(client_fd);
         return;
@@ -418,22 +381,26 @@ static void nghttp2_server_handle_connection(nghttp2_server_object *intern, int 
 
     SSL_get0_alpn_selected(conn.ssl, &alpn, &alpn_len);
     if (!(alpn_len == 2 && memcmp(alpn, "h2", 2) == 0)) {
+        nghttp2_server_response_tracker_destroy(&conn);
         SSL_shutdown(conn.ssl);
         SSL_free(conn.ssl);
         close(client_fd);
         return;
     }
 
-    session = nghttp2_server_setup_session(&conn);
-    if (session == NULL) {
+    if (nghttp2_session_create(&conn.session_obj, 1) != SUCCESS) {
+        zend_clear_exception();
+        nghttp2_server_response_tracker_destroy(&conn);
         SSL_shutdown(conn.ssl);
         SSL_free(conn.ssl);
         close(client_fd);
         return;
     }
 
-    if (nghttp2_session_send(session) != 0) {
-        nghttp2_session_del(session);
+    if (nghttp2_server_flush_session_outbound(&conn) != SUCCESS) {
+        nghttp2_session_close_zval(&conn.session_obj);
+        zval_ptr_dtor(&conn.session_obj);
+        nghttp2_server_response_tracker_destroy(&conn);
         SSL_shutdown(conn.ssl);
         SSL_free(conn.ssl);
         close(client_fd);
@@ -453,19 +420,20 @@ static void nghttp2_server_handle_connection(nghttp2_server_object *intern, int 
             break;
         }
 
-        if (nghttp2_session_mem_recv(session, buf, (size_t)n) < 0) {
+        if (nghttp2_session_receive_bytes(&conn.session_obj, buf, (size_t)n, NULL) != SUCCESS) {
             break;
         }
-        if (nghttp2_session_send(session) != 0) {
-            break;
-        }
-        if (nghttp2_session_want_read(session) == 0 &&
-            nghttp2_session_want_write(session) == 0) {
+
+        nghttp2_server_process_session_events(&conn);
+
+        if (nghttp2_server_flush_session_outbound(&conn) != SUCCESS) {
             break;
         }
     }
 
-    nghttp2_session_del(session);
+    nghttp2_session_close_zval(&conn.session_obj);
+    zval_ptr_dtor(&conn.session_obj);
+    nghttp2_server_response_tracker_destroy(&conn);
     SSL_shutdown(conn.ssl);
     SSL_free(conn.ssl);
     close(client_fd);

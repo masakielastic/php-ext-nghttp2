@@ -8,6 +8,7 @@ typedef struct _nghttp2_session_stream_state {
     int32_t stream_id;
     zval headers;
     zend_bool collecting_headers;
+    zend_bool inbound_end_stream;
     uint8_t headers_category;
     struct _nghttp2_session_outgoing_chunk *outgoing_head;
     struct _nghttp2_session_outgoing_chunk *outgoing_tail;
@@ -138,6 +139,7 @@ static nghttp2_session_stream_state *nghttp2_session_stream_state_get(
     state->stream_id = stream_id;
     ZVAL_UNDEF(&state->headers);
     state->collecting_headers = 0;
+    state->inbound_end_stream = 0;
     state->headers_category = NGHTTP2_HCAT_HEADERS;
     state->outgoing_head = NULL;
     state->outgoing_tail = NULL;
@@ -435,7 +437,18 @@ static int nghttp2_session_on_frame_recv_cb(
                 state,
                 (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
             );
+            if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+                state->inbound_end_stream = 1;
+            }
             nghttp2_session_stream_state_reset_headers(state);
+            break;
+        case NGHTTP2_DATA:
+            if (frame->hd.stream_id > 0 && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+                state = nghttp2_session_stream_state_get(intern, frame->hd.stream_id, 1);
+                if (state != NULL) {
+                    state->inbound_end_stream = 1;
+                }
+            }
             break;
         case NGHTTP2_SETTINGS:
             nghttp2_session_queue_settings_event(intern, &frame->settings);
@@ -953,6 +966,89 @@ int nghttp2_session_submit_request_headers(zval *zv, zval *headers, zend_bool en
     }
 
     return SUCCESS;
+}
+
+int nghttp2_session_submit_response_headers(zval *zv, zend_long stream_id, zval *headers, zend_bool end_stream)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+
+    if (nghttp2_session_require_open(intern) != SUCCESS) {
+        return FAILURE;
+    }
+
+    return nghttp2_session_submit_headers_internal(intern, stream_id, headers, end_stream);
+}
+
+int nghttp2_session_submit_data_string(zval *zv, zend_long stream_id, zend_string *data, zend_bool end_stream)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    nghttp2_session_stream_state *state;
+    nghttp2_data_provider provider;
+    int rv;
+
+    if (nghttp2_session_require_open(intern) != SUCCESS) {
+        return FAILURE;
+    }
+    if (stream_id <= 0) {
+        nghttp2_throw_session_exception("streamId must be greater than 0", NGHTTP2_ERR_INVALID_ARGUMENT);
+        return FAILURE;
+    }
+
+    state = nghttp2_session_stream_state_get(intern, (int32_t)stream_id, 0);
+    if (state == NULL) {
+        nghttp2_throw_session_exception("stream state not found", NGHTTP2_ERR_INVALID_STATE);
+        return FAILURE;
+    }
+    if (state->outgoing_tail != NULL && state->outgoing_tail->end_stream) {
+        nghttp2_throw_session_exception("stream already has a final outbound chunk queued", NGHTTP2_ERR_INVALID_STATE);
+        return FAILURE;
+    }
+
+    if (nghttp2_session_stream_state_queue_outgoing_chunk(state, data, end_stream) != SUCCESS) {
+        nghttp2_throw_session_exception("failed to queue outbound data", NGHTTP2_ERR_NOMEM);
+        return FAILURE;
+    }
+
+    if (!state->outgoing_submission_started) {
+        memset(&provider, 0, sizeof(provider));
+        provider.source.ptr = state;
+        provider.read_callback = nghttp2_session_data_read_cb;
+
+        rv = nghttp2_submit_data(
+            intern->session,
+            NGHTTP2_FLAG_END_STREAM,
+            (int32_t)stream_id,
+            &provider
+        );
+        if (rv != 0) {
+            nghttp2_session_stream_state_pop_outgoing_head(state);
+            nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+            return FAILURE;
+        }
+        state->outgoing_submission_started = 1;
+        state->outgoing_deferred = 0;
+    } else if (state->outgoing_deferred) {
+        rv = nghttp2_session_resume_data(intern->session, (int32_t)stream_id);
+        if (rv != 0) {
+            nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+            return FAILURE;
+        }
+    }
+
+    return nghttp2_session_flush_outbound(intern);
+}
+
+zend_bool nghttp2_session_stream_has_inbound_end(zval *zv, int32_t stream_id)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    nghttp2_session_stream_state *state;
+
+    state = nghttp2_session_stream_state_get(intern, stream_id, 0);
+    if (state == NULL) {
+        return 0;
+    }
+
+    return state->inbound_end_stream;
 }
 
 void nghttp2_session_close_zval(zval *zv)

@@ -34,6 +34,8 @@ $client = Nghttp2\Session::client();
 $server = Nghttp2\Session::server();
 
 drain($client, $server);
+$client->popEvents();
+$server->popEvents();
 
 $streamId = $client->submitRequest([
     ['name' => ':method', 'value' => 'GET'],

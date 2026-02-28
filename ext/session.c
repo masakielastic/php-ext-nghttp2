@@ -1,6 +1,7 @@
 #include "php_nghttp2.h"
 
 #include <Zend/zend_smart_str.h>
+#include <inttypes.h>
 #include <string.h>
 
 typedef struct _nghttp2_session_stream_state {
@@ -32,11 +33,6 @@ static inline nghttp2_session_object *nghttp2_session_from_obj(zend_object *obj)
 }
 
 #define Z_NGHTTP2_SESSION_OBJ_P(zv) nghttp2_session_from_obj(Z_OBJ_P((zv)))
-
-static void nghttp2_session_throw_not_implemented(void)
-{
-    nghttp2_throw_session_exception("method is not implemented yet", NGHTTP2_ERR_INVALID_STATE);
-}
 
 static void nghttp2_session_reset_events(nghttp2_session_object *intern)
 {
@@ -213,6 +209,79 @@ static void nghttp2_session_queue_stream_close_event(
     add_next_index_zval(&intern->events, &event);
 }
 
+static void nghttp2_session_queue_settings_event(
+    nghttp2_session_object *intern,
+    const nghttp2_settings *settings_frame
+)
+{
+    zval event;
+    zval settings;
+    size_t i;
+
+    array_init(&event);
+    add_assoc_string(&event, "type", "settings");
+    add_assoc_bool(&event, "ack", (settings_frame->hd.flags & NGHTTP2_FLAG_ACK) != 0);
+
+    array_init(&settings);
+    for (i = 0; i < settings_frame->niv; i++) {
+        zval entry;
+
+        array_init(&entry);
+        add_assoc_long(&entry, "id", settings_frame->iv[i].settings_id);
+        add_assoc_long(&entry, "value", settings_frame->iv[i].value);
+        add_next_index_zval(&settings, &entry);
+    }
+
+    add_assoc_zval(&event, "settings", &settings);
+    add_next_index_zval(&intern->events, &event);
+}
+
+static void nghttp2_session_queue_ping_event(
+    nghttp2_session_object *intern,
+    const nghttp2_ping *ping_frame
+)
+{
+    zval event;
+
+    array_init(&event);
+    add_assoc_string(&event, "type", "ping");
+    add_assoc_bool(&event, "ack", (ping_frame->hd.flags & NGHTTP2_FLAG_ACK) != 0);
+    add_assoc_stringl(&event, "opaqueData", (const char *)ping_frame->opaque_data, sizeof(ping_frame->opaque_data));
+
+    add_next_index_zval(&intern->events, &event);
+}
+
+static void nghttp2_session_queue_goaway_event(
+    nghttp2_session_object *intern,
+    const nghttp2_goaway *goaway_frame
+)
+{
+    zval event;
+
+    array_init(&event);
+    add_assoc_string(&event, "type", "goaway");
+    add_assoc_long(&event, "lastStreamId", goaway_frame->last_stream_id);
+    add_assoc_long(&event, "errorCode", (zend_long)goaway_frame->error_code);
+    add_assoc_stringl(&event, "debugData", (const char *)goaway_frame->opaque_data, goaway_frame->opaque_data_len);
+
+    add_next_index_zval(&intern->events, &event);
+}
+
+static void nghttp2_session_queue_rst_stream_event(
+    nghttp2_session_object *intern,
+    const nghttp2_rst_stream *rst_stream_frame
+)
+{
+    zval event;
+
+    array_init(&event);
+    add_assoc_string(&event, "type", "rst_stream");
+    add_assoc_long(&event, "streamId", rst_stream_frame->hd.stream_id);
+    add_assoc_long(&event, "errorCode", (zend_long)rst_stream_frame->error_code);
+
+    add_next_index_zval(&intern->events, &event);
+}
+
 static void nghttp2_session_release(nghttp2_session_object *intern, zend_bool reinitialize_state)
 {
     if (intern->session != NULL) {
@@ -329,21 +398,39 @@ static int nghttp2_session_on_frame_recv_cb(
 
     (void)session;
 
-    if (frame->hd.type != NGHTTP2_HEADERS || frame->hd.stream_id <= 0) {
-        return 0;
-    }
+    switch (frame->hd.type) {
+        case NGHTTP2_HEADERS:
+            if (frame->hd.stream_id <= 0) {
+                return 0;
+            }
 
-    state = nghttp2_session_stream_state_get(intern, frame->hd.stream_id, 0);
-    if (state == NULL || !state->collecting_headers) {
-        return 0;
-    }
+            state = nghttp2_session_stream_state_get(intern, frame->hd.stream_id, 0);
+            if (state == NULL || !state->collecting_headers) {
+                return 0;
+            }
 
-    nghttp2_session_queue_headers_event(
-        intern,
-        state,
-        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
-    );
-    nghttp2_session_stream_state_reset_headers(state);
+            nghttp2_session_queue_headers_event(
+                intern,
+                state,
+                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
+            );
+            nghttp2_session_stream_state_reset_headers(state);
+            break;
+        case NGHTTP2_SETTINGS:
+            nghttp2_session_queue_settings_event(intern, &frame->settings);
+            break;
+        case NGHTTP2_PING:
+            nghttp2_session_queue_ping_event(intern, &frame->ping);
+            break;
+        case NGHTTP2_GOAWAY:
+            nghttp2_session_queue_goaway_event(intern, &frame->goaway);
+            break;
+        case NGHTTP2_RST_STREAM:
+            nghttp2_session_queue_rst_stream_event(intern, &frame->rst_stream);
+            break;
+        default:
+            break;
+    }
 
     return 0;
 }
@@ -545,6 +632,76 @@ static int nghttp2_session_build_nv_array(zval *headers, nghttp2_nv **nva_out, s
     } ZEND_HASH_FOREACH_END();
 
     *nva_out = nva;
+    return SUCCESS;
+}
+
+static int nghttp2_session_build_settings_entries(
+    zval *settings,
+    nghttp2_settings_entry **iv_out,
+    size_t *niv_out
+)
+{
+    HashTable *settings_ht;
+    nghttp2_settings_entry *iv;
+    zval *entry;
+    size_t niv;
+    size_t i = 0;
+
+    settings_ht = Z_ARRVAL_P(settings);
+    niv = zend_hash_num_elements(settings_ht);
+    *niv_out = niv;
+    if (niv == 0) {
+        *iv_out = NULL;
+        return SUCCESS;
+    }
+
+    iv = ecalloc(niv, sizeof(*iv));
+
+    ZEND_HASH_FOREACH_VAL(settings_ht, entry) {
+        zval *id;
+        zval *value;
+        zend_long id_long;
+        zend_long value_long;
+
+        if (Z_TYPE_P(entry) != IS_ARRAY) {
+            efree(iv);
+            zend_type_error("each setting must be an array with keys 'id' and 'value'");
+            return FAILURE;
+        }
+
+        id = zend_hash_str_find(Z_ARRVAL_P(entry), "id", sizeof("id") - 1);
+        value = zend_hash_str_find(Z_ARRVAL_P(entry), "value", sizeof("value") - 1);
+        if (id == NULL || value == NULL) {
+            efree(iv);
+            zend_type_error("each setting must contain both 'id' and 'value'");
+            return FAILURE;
+        }
+
+        id_long = zval_get_long(id);
+        value_long = zval_get_long(value);
+
+        if (id_long <= 0 || id_long > INT32_MAX) {
+            efree(iv);
+            zend_value_error("setting 'id' must be between 1 and %d", INT32_MAX);
+            return FAILURE;
+        }
+        if (value_long < 0) {
+            efree(iv);
+            zend_value_error("setting 'value' must be greater than or equal to 0");
+            return FAILURE;
+        }
+        if ((uint64_t)value_long > UINT32_MAX) {
+            efree(iv);
+            zend_value_error("setting 'value' must be less than or equal to %" PRIu32, UINT32_MAX);
+            return FAILURE;
+        }
+
+        iv[i].settings_id = (int32_t)id_long;
+        iv[i].value = (uint32_t)value_long;
+        i++;
+    } ZEND_HASH_FOREACH_END();
+
+    *iv_out = iv;
     return SUCCESS;
 }
 
@@ -972,6 +1129,9 @@ ZEND_METHOD(Nghttp2_Session, submitSettings)
 {
     zval *settings;
     nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(ZEND_THIS);
+    nghttp2_settings_entry *iv = NULL;
+    size_t niv = 0;
+    int rv;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ARRAY(settings)
@@ -981,15 +1141,31 @@ ZEND_METHOD(Nghttp2_Session, submitSettings)
         RETURN_THROWS();
     }
 
-    (void)settings;
-    nghttp2_session_throw_not_implemented();
-    RETURN_THROWS();
+    if (nghttp2_session_build_settings_entries(settings, &iv, &niv) != SUCCESS) {
+        RETURN_THROWS();
+    }
+
+    rv = nghttp2_submit_settings(intern->session, NGHTTP2_FLAG_NONE, iv, niv);
+    if (iv != NULL) {
+        efree(iv);
+    }
+
+    if (rv != 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+        RETURN_THROWS();
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        RETURN_THROWS();
+    }
 }
 
 ZEND_METHOD(Nghttp2_Session, submitPing)
 {
     zend_string *opaque_data = NULL;
     nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(ZEND_THIS);
+    const uint8_t *payload = NULL;
+    int rv;
 
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
@@ -1000,9 +1176,23 @@ ZEND_METHOD(Nghttp2_Session, submitPing)
         RETURN_THROWS();
     }
 
-    (void)opaque_data;
-    nghttp2_session_throw_not_implemented();
-    RETURN_THROWS();
+    if (opaque_data != NULL) {
+        if (ZSTR_LEN(opaque_data) != 8) {
+            zend_argument_value_error(1, "must be exactly 8 bytes");
+            RETURN_THROWS();
+        }
+        payload = (const uint8_t *)ZSTR_VAL(opaque_data);
+    }
+
+    rv = nghttp2_submit_ping(intern->session, NGHTTP2_FLAG_NONE, payload);
+    if (rv != 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+        RETURN_THROWS();
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        RETURN_THROWS();
+    }
 }
 
 ZEND_METHOD(Nghttp2_Session, submitRstStream)
@@ -1010,6 +1200,7 @@ ZEND_METHOD(Nghttp2_Session, submitRstStream)
     zend_long stream_id;
     zend_long error_code;
     nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(ZEND_THIS);
+    int rv;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_LONG(stream_id)
@@ -1020,10 +1211,24 @@ ZEND_METHOD(Nghttp2_Session, submitRstStream)
         RETURN_THROWS();
     }
 
-    (void)stream_id;
-    (void)error_code;
-    nghttp2_session_throw_not_implemented();
-    RETURN_THROWS();
+    if (stream_id <= 0) {
+        zend_argument_value_error(1, "must be greater than 0");
+        RETURN_THROWS();
+    }
+    if (error_code < 0) {
+        zend_argument_value_error(2, "must be greater than or equal to 0");
+        RETURN_THROWS();
+    }
+
+    rv = nghttp2_submit_rst_stream(intern->session, NGHTTP2_FLAG_NONE, (int32_t)stream_id, (uint32_t)error_code);
+    if (rv != 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+        RETURN_THROWS();
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        RETURN_THROWS();
+    }
 }
 
 ZEND_METHOD(Nghttp2_Session, submitGoaway)
@@ -1031,6 +1236,8 @@ ZEND_METHOD(Nghttp2_Session, submitGoaway)
     zend_long error_code = 0;
     zend_string *debug_data = NULL;
     nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(ZEND_THIS);
+    int32_t last_stream_id;
+    int rv;
 
     ZEND_PARSE_PARAMETERS_START(0, 2)
         Z_PARAM_OPTIONAL
@@ -1042,10 +1249,28 @@ ZEND_METHOD(Nghttp2_Session, submitGoaway)
         RETURN_THROWS();
     }
 
-    (void)error_code;
-    (void)debug_data;
-    nghttp2_session_throw_not_implemented();
-    RETURN_THROWS();
+    if (error_code < 0) {
+        zend_argument_value_error(1, "must be greater than or equal to 0");
+        RETURN_THROWS();
+    }
+
+    last_stream_id = nghttp2_session_get_last_proc_stream_id(intern->session);
+    rv = nghttp2_submit_goaway(
+        intern->session,
+        NGHTTP2_FLAG_NONE,
+        last_stream_id,
+        (uint32_t)error_code,
+        debug_data != NULL ? (const uint8_t *)ZSTR_VAL(debug_data) : NULL,
+        debug_data != NULL ? ZSTR_LEN(debug_data) : 0
+    );
+    if (rv != 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
+        RETURN_THROWS();
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        RETURN_THROWS();
+    }
 }
 
 ZEND_METHOD(Nghttp2_Session, close)

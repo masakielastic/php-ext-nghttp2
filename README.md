@@ -7,9 +7,9 @@ This extension aims to expose a minimal, explicit, and
 stateful interface to HTTP/2 primitives including:
 
 - HPACK (RFC 7541)
+- Low-level HTTP/2 session API for userland event loops
 - Blocking HTTP/2 client
 - Blocking HTTP/2 server
-- Frame-level access (planned)
 
 The design focuses on low-level experimentation,
 blocking APIs, and educational use.
@@ -19,6 +19,7 @@ blocking APIs, and educational use.
 ## Features (Current)
 
 - Stateful HPACK encoder/decoder
+- Low-level HTTP/2 session API
 - Blocking HTTP/2 client over TLS (ALPN `h2`)
 - Blocking HTTP/2 server over TLS (ALPN `h2`)
 - Configurable server response (`setResponse`)
@@ -108,6 +109,213 @@ final class Hpack
 
     public function encode(array $headers): string;
     public function decode(string $headerBlock): array;
+}
+```
+
+---
+
+## API Layers
+
+- `Nghttp2\Hpack`: stateful HPACK encoder/decoder
+- `Nghttp2\Session`: transport-agnostic HTTP/2 session API for userland event loops
+- `Nghttp2\Client`: blocking HTTPS client helper
+- `Nghttp2\Server`: blocking HTTPS server helper
+
+`Nghttp2\Session` does not open sockets, perform TLS handshakes, or run an event loop.
+Those responsibilities stay in userland PHP.
+
+---
+
+## Session API
+
+Class: `Nghttp2\Session`
+
+```php
+final class Session
+{
+    public static function client(array $options = []): self;
+    public static function server(array $options = []): self;
+
+    public function receive(string $bytes): int;
+    public function popOutbound(): string;
+    public function popEvents(): array;
+
+    public function wantsRead(): bool;
+    public function wantsWrite(): bool;
+
+    public function submitRequest(array $headers, bool $endStream = true): int;
+    public function submitResponse(int $streamId, array $headers, bool $endStream = false): void;
+    public function submitHeaders(int $streamId, array $headers, bool $endStream = false): void;
+    public function submitData(int $streamId, string $data, bool $endStream = false): void;
+
+    public function submitSettings(array $settings): void;
+    public function submitPing(string $opaqueData = ""): void;
+    public function submitRstStream(int $streamId, int $errorCode): void;
+    public function submitGoaway(int $errorCode = 0, string $debugData = ""): void;
+
+    public function close(): void;
+}
+```
+
+### Basic Flow
+
+`Nghttp2\Session` follows a simple loop:
+
+1. Feed inbound bytes using `receive()`
+2. Read outbound bytes using `popOutbound()`
+3. Consume parsed protocol events using `popEvents()`
+
+This makes it suitable for custom socket code, TLS streams, and PHP userland event loops.
+
+### Events
+
+`popEvents()` returns arrays such as:
+
+```php
+['type' => 'headers', 'streamId' => 1, 'category' => 'request', 'endStream' => false, 'headers' => [...]]
+['type' => 'data', 'streamId' => 1, 'data' => "chunk"]
+['type' => 'stream_close', 'streamId' => 1, 'errorCode' => 0]
+['type' => 'settings', 'ack' => false, 'settings' => [['id' => 3, 'value' => 100]]]
+['type' => 'ping', 'ack' => true, 'opaqueData' => "12345678"]
+['type' => 'goaway', 'lastStreamId' => 1, 'errorCode' => 0, 'debugData' => ""]
+['type' => 'rst_stream', 'streamId' => 1, 'errorCode' => 8]
+```
+
+### Session Client Example
+
+```php
+$context = stream_context_create([
+    'ssl' => [
+        'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
+        'verify_peer' => true,
+        'verify_peer_name' => true,
+        'alpn_protocols' => "h2",
+        'SNI_enabled' => true,
+    ],
+]);
+
+$socket = stream_socket_client(
+    'tls://example.com:443',
+    $errno,
+    $errstr,
+    10,
+    STREAM_CLIENT_CONNECT,
+    $context
+);
+
+if ($socket === false) {
+    throw new RuntimeException("connect failed: {$errstr}", $errno);
+}
+
+stream_set_blocking($socket, false);
+
+$session = Nghttp2\Session::client();
+$streamId = $session->submitRequest([
+    ['name' => ':method', 'value' => 'GET'],
+    ['name' => ':scheme', 'value' => 'https'],
+    ['name' => ':authority', 'value' => 'example.com'],
+    ['name' => ':path', 'value' => '/'],
+], true);
+
+$body = '';
+$closed = false;
+
+while (!$closed) {
+    $out = $session->popOutbound();
+    if ($out !== '') {
+        fwrite($socket, $out);
+    }
+
+    $read = [$socket];
+    $write = $session->wantsWrite() ? [$socket] : [];
+    $except = null;
+
+    stream_select($read, $write, $except, 5);
+
+    if ($read) {
+        $chunk = fread($socket, 65535);
+        if ($chunk !== '' && $chunk !== false) {
+            $session->receive($chunk);
+        }
+    }
+
+    foreach ($session->popEvents() as $event) {
+        if (($event['streamId'] ?? null) !== $streamId) {
+            continue;
+        }
+
+        if ($event['type'] === 'data') {
+            $body .= $event['data'];
+        } elseif ($event['type'] === 'stream_close') {
+            $closed = true;
+        }
+    }
+}
+```
+
+### Session Server Example
+
+```php
+$context = stream_context_create([
+    'ssl' => [
+        'local_cert' => __DIR__ . '/server.crt',
+        'local_pk' => __DIR__ . '/server.key',
+        'allow_self_signed' => true,
+        'verify_peer' => false,
+        'alpn_protocols' => "h2",
+    ],
+]);
+
+$server = stream_socket_server(
+    'tls://127.0.0.1:8443',
+    $errno,
+    $errstr,
+    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+    $context
+);
+
+$socket = stream_socket_accept($server);
+stream_set_blocking($socket, false);
+
+$session = Nghttp2\Session::server();
+$running = true;
+
+while ($running) {
+    $out = $session->popOutbound();
+    if ($out !== '') {
+        fwrite($socket, $out);
+    }
+
+    $read = [$socket];
+    $write = $session->wantsWrite() ? [$socket] : [];
+    $except = null;
+
+    stream_select($read, $write, $except, 5);
+
+    if ($read) {
+        $chunk = fread($socket, 65535);
+        if ($chunk !== '' && $chunk !== false) {
+            $session->receive($chunk);
+        }
+    }
+
+    foreach ($session->popEvents() as $event) {
+        if ($event['type'] !== 'headers' || $event['category'] !== 'request') {
+            continue;
+        }
+
+        $streamId = $event['streamId'];
+        $body = "hello from Session\n";
+
+        $session->submitResponse($streamId, [
+            ['name' => ':status', 'value' => '200'],
+            ['name' => 'content-type', 'value' => 'text/plain'],
+            ['name' => 'content-length', 'value' => (string) strlen($body)],
+        ], false);
+
+        $session->submitData($streamId, $body, true);
+        $running = false;
+    }
 }
 ```
 
@@ -217,6 +425,7 @@ All nghttp2-related failures throw:
 
 ```php
 Nghttp2\Exception\HpackException
+Nghttp2\Exception\SessionException
 Nghttp2\Exception\ClientException
 Nghttp2\Exception\ServerException
 ```
@@ -290,7 +499,7 @@ curl -k --http2 https://127.0.0.1:8443/
 ## Non-Goals
  * High-level HTTP client abstraction
  * PSR-7 integration
- * Asynchronous event loop integration
+ * Built-in event loop abstraction
  * HTTP/3 (QPACK)
 
 ---

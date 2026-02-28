@@ -35,4 +35,11 @@ int nghttp2_headers_normalize(zval *headers, zval *normalized, uint32_t flags);
 int nghttp2_headers_build_nv_array(zval *headers, nghttp2_nv **nva_out, size_t *nvlen_out);
 int nghttp2_submit_default_settings(nghttp2_session *session);
 
+int nghttp2_session_create(zval *zv, zend_bool is_server);
+int nghttp2_session_receive_bytes(zval *zv, const uint8_t *bytes, size_t len, ssize_t *consumed_out);
+zend_string *nghttp2_session_pop_outbound_string(zval *zv);
+void nghttp2_session_pop_events_array(zval *zv, zval *events_out);
+int nghttp2_session_submit_request_headers(zval *zv, zval *headers, zend_bool end_stream, int32_t *stream_id_out);
+void nghttp2_session_close_zval(zval *zv);
+
 #endif

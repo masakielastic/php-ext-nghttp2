@@ -814,6 +814,159 @@ static zend_object *nghttp2_session_create_object(zend_class_entry *ce)
     return &intern->std;
 }
 
+int nghttp2_session_create(zval *zv, zend_bool is_server)
+{
+    nghttp2_session_object *intern;
+
+    object_init_ex(zv, nghttp2_ce_session);
+    intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+
+    if (nghttp2_session_initialize(intern, is_server) != SUCCESS) {
+        zval_ptr_dtor(zv);
+        ZVAL_UNDEF(zv);
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+int nghttp2_session_receive_bytes(zval *zv, const uint8_t *bytes, size_t len, ssize_t *consumed_out)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    ssize_t rv;
+
+    if (consumed_out != NULL) {
+        *consumed_out = 0;
+    }
+
+    if (nghttp2_session_require_open(intern) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (len == 0) {
+        return SUCCESS;
+    }
+
+    rv = nghttp2_session_mem_recv(intern->session, bytes, len);
+    if (rv < 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror((int)rv), (int)rv);
+        return FAILURE;
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (consumed_out != NULL) {
+        *consumed_out = rv;
+    }
+
+    return SUCCESS;
+}
+
+zend_string *nghttp2_session_pop_outbound_string(zval *zv)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    zend_string *out;
+
+    if (intern->outbound.s == NULL) {
+        return zend_string_init("", 0, 0);
+    }
+
+    out = zend_string_copy(intern->outbound.s);
+    nghttp2_session_reset_outbound(intern);
+
+    return out;
+}
+
+void nghttp2_session_pop_events_array(zval *zv, zval *events_out)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+
+    ZVAL_COPY(events_out, &intern->events);
+    nghttp2_session_reset_events(intern);
+}
+
+int nghttp2_session_submit_request_headers(zval *zv, zval *headers, zend_bool end_stream, int32_t *stream_id_out)
+{
+    nghttp2_session_object *intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    nghttp2_nv *nva = NULL;
+    size_t nvlen = 0;
+    int32_t stream_id;
+    nghttp2_session_stream_state *state;
+
+    if (stream_id_out != NULL) {
+        *stream_id_out = -1;
+    }
+
+    if (nghttp2_session_require_open(intern) != SUCCESS) {
+        return FAILURE;
+    }
+    if (nghttp2_headers_build_nv_array(headers, &nva, &nvlen) != SUCCESS) {
+        return FAILURE;
+    }
+
+    state = nghttp2_session_stream_state_get(intern, 0, 1);
+    if (state == NULL) {
+        if (nva != NULL) {
+            efree(nva);
+        }
+        nghttp2_throw_session_exception("failed to allocate stream state", NGHTTP2_ERR_NOMEM);
+        return FAILURE;
+    }
+
+    if (!end_stream) {
+        nghttp2_data_provider provider;
+
+        memset(&provider, 0, sizeof(provider));
+        provider.source.ptr = state;
+        provider.read_callback = nghttp2_session_data_read_cb;
+
+        stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, &provider, state);
+        state->outgoing_submission_started = 1;
+        state->outgoing_deferred = 0;
+    } else {
+        stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, NULL, state);
+    }
+    if (nva != NULL) {
+        efree(nva);
+    }
+
+    if (stream_id < 0) {
+        nghttp2_throw_session_exception(nghttp2_strerror(stream_id), stream_id);
+        return FAILURE;
+    }
+
+    if (stream_id != 0 && state != NULL) {
+        zend_hash_index_del(&intern->stream_states, 0);
+        state->stream_id = stream_id;
+        zend_hash_index_add_ptr(&intern->stream_states, (zend_ulong)stream_id, state);
+        nghttp2_session_set_stream_user_data(intern->session, stream_id, state);
+    }
+
+    if (nghttp2_session_flush_outbound(intern) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (stream_id_out != NULL) {
+        *stream_id_out = stream_id;
+    }
+
+    return SUCCESS;
+}
+
+void nghttp2_session_close_zval(zval *zv)
+{
+    nghttp2_session_object *intern;
+
+    if (Z_TYPE_P(zv) == IS_UNDEF) {
+        return;
+    }
+
+    intern = Z_NGHTTP2_SESSION_OBJ_P(zv);
+    nghttp2_session_release(intern, 1);
+}
+
 static void nghttp2_session_free_object(zend_object *object)
 {
     nghttp2_session_object *intern = nghttp2_session_from_obj(object);

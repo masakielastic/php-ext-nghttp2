@@ -1,6 +1,7 @@
 #include "php_nghttp2.h"
 
 #include <Zend/zend_smart_str.h>
+#include <Zend/zend_exceptions.h>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -18,7 +19,7 @@ typedef struct _nghttp2_client_object {
     int fd;
     SSL_CTX *ssl_ctx;
     SSL *ssl;
-    nghttp2_session *session;
+    zval session_obj;
 
     zend_string *host;
     zend_long port;
@@ -47,9 +48,10 @@ static inline nghttp2_client_object *nghttp2_client_from_obj(zend_object *obj)
 
 static void nghttp2_client_close_connection(nghttp2_client_object *intern)
 {
-    if (intern->session != NULL) {
-        nghttp2_session_del(intern->session);
-        intern->session = NULL;
+    if (Z_TYPE(intern->session_obj) != IS_UNDEF) {
+        nghttp2_session_close_zval(&intern->session_obj);
+        zval_ptr_dtor(&intern->session_obj);
+        ZVAL_UNDEF(&intern->session_obj);
     }
     if (intern->ssl != NULL) {
         SSL_shutdown(intern->ssl);
@@ -179,147 +181,162 @@ static int nghttp2_client_ssl_handshake(nghttp2_client_object *intern)
     return SUCCESS;
 }
 
-static ssize_t nghttp2_client_send_cb(
-    nghttp2_session *session,
-    const uint8_t *data,
-    size_t length,
-    int flags,
-    void *user_data
-)
+static void nghttp2_client_rethrow_session_exception(const char *fallback_message, int fallback_code)
 {
-    nghttp2_client_object *intern = (nghttp2_client_object *)user_data;
+    zend_string *message = NULL;
+    int error_code = fallback_code;
+
+    if (EG(exception) != NULL && instanceof_function(EG(exception)->ce, nghttp2_ce_session_exception)) {
+        zval *message_zv;
+        zval *code_zv;
+
+        message_zv = zend_read_property(zend_ce_exception, EG(exception), "message", sizeof("message") - 1, 1, NULL);
+        code_zv = zend_read_property(nghttp2_ce_session_exception, EG(exception), "nghttp2ErrorCode", sizeof("nghttp2ErrorCode") - 1, 1, NULL);
+
+        if (message_zv != NULL && Z_TYPE_P(message_zv) == IS_STRING) {
+            message = zend_string_copy(Z_STR_P(message_zv));
+        }
+        if (code_zv != NULL) {
+            error_code = zval_get_long(code_zv);
+        }
+    }
+
+    if (EG(exception) != NULL) {
+        OBJ_RELEASE(EG(exception));
+        EG(exception) = NULL;
+    }
+    if (message != NULL) {
+        nghttp2_throw_client_exception(ZSTR_VAL(message), error_code);
+        zend_string_release(message);
+    } else {
+        nghttp2_throw_client_exception(fallback_message, error_code);
+    }
+}
+
+static int nghttp2_client_ssl_write_all(nghttp2_client_object *intern, zend_string *data)
+{
     size_t off = 0;
 
-    (void)session;
-    (void)flags;
-
-    while (off < length) {
-        int n = SSL_write(intern->ssl, data + off, (int)(length - off));
+    while (off < ZSTR_LEN(data)) {
+        int n = SSL_write(intern->ssl, ZSTR_VAL(data) + off, (int)(ZSTR_LEN(data) - off));
         if (n <= 0) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
+            nghttp2_throw_client_exception("failed to write request to TLS stream", NGHTTP2_ERR_CALLBACK_FAILURE);
+            return FAILURE;
         }
         off += (size_t)n;
     }
-    return (ssize_t)length;
-}
-
-static int nghttp2_client_on_header_cb(
-    nghttp2_session *session,
-    const nghttp2_frame *frame,
-    const uint8_t *name,
-    size_t namelen,
-    const uint8_t *value,
-    size_t valuelen,
-    uint8_t flags,
-    void *user_data
-)
-{
-    nghttp2_client_object *intern = (nghttp2_client_object *)user_data;
-
-    (void)session;
-    (void)flags;
-
-    if (frame->hd.type != NGHTTP2_HEADERS ||
-        frame->headers.cat != NGHTTP2_HCAT_RESPONSE ||
-        frame->hd.stream_id != intern->stream_id) {
-        return 0;
-    }
-
-    if (namelen == sizeof(":status") - 1 && memcmp(name, ":status", sizeof(":status") - 1) == 0) {
-        zend_long parsed = 0;
-        if (is_numeric_string((const char *)value, valuelen, &parsed, NULL, 0) == IS_LONG) {
-            intern->status = parsed;
-            intern->has_status = 1;
-        }
-        return 0;
-    }
-
-    {
-        zval header;
-        zval name_zv;
-        zval value_zv;
-
-        array_init(&header);
-        ZVAL_STRINGL(&name_zv, (const char *)name, namelen);
-        ZVAL_STRINGL(&value_zv, (const char *)value, valuelen);
-        zend_hash_str_update(Z_ARRVAL(header), "name", sizeof("name") - 1, &name_zv);
-        zend_hash_str_update(Z_ARRVAL(header), "value", sizeof("value") - 1, &value_zv);
-        add_next_index_zval(&intern->response_headers, &header);
-    }
-
-    return 0;
-}
-
-static int nghttp2_client_on_data_chunk_recv_cb(
-    nghttp2_session *session,
-    uint8_t flags,
-    int32_t stream_id,
-    const uint8_t *data,
-    size_t len,
-    void *user_data
-)
-{
-    nghttp2_client_object *intern = (nghttp2_client_object *)user_data;
-
-    (void)session;
-    (void)flags;
-
-    if (stream_id == intern->stream_id) {
-        smart_str_appendl(&intern->response_body, (const char *)data, len);
-    }
-    return 0;
-}
-
-static int nghttp2_client_on_stream_close_cb(
-    nghttp2_session *session,
-    int32_t stream_id,
-    uint32_t error_code,
-    void *user_data
-)
-{
-    nghttp2_client_object *intern = (nghttp2_client_object *)user_data;
-
-    (void)session;
-    (void)error_code;
-
-    if (stream_id == intern->stream_id) {
-        intern->stream_closed = 1;
-    }
-    return 0;
-}
-
-static int nghttp2_client_session_init(nghttp2_client_object *intern)
-{
-    nghttp2_session_callbacks *cbs = NULL;
-    int rv;
-
-    rv = nghttp2_session_callbacks_new(&cbs);
-    if (rv != 0) {
-        return FAILURE;
-    }
-
-    nghttp2_session_callbacks_set_send_callback(cbs, nghttp2_client_send_cb);
-    nghttp2_session_callbacks_set_on_header_callback(cbs, nghttp2_client_on_header_cb);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, nghttp2_client_on_data_chunk_recv_cb);
-    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, nghttp2_client_on_stream_close_cb);
-
-    rv = nghttp2_session_client_new(&intern->session, cbs, intern);
-    nghttp2_session_callbacks_del(cbs);
-    if (rv != 0) {
-        return FAILURE;
-    }
-
-    rv = nghttp2_submit_default_settings(intern->session);
-    if (rv != 0) {
-        return FAILURE;
-    }
-
-    rv = nghttp2_session_send(intern->session);
-    if (rv != 0) {
-        return FAILURE;
-    }
 
     return SUCCESS;
+}
+
+static int nghttp2_client_flush_session_outbound(nghttp2_client_object *intern)
+{
+    zend_string *outbound;
+    int result = SUCCESS;
+
+    outbound = nghttp2_session_pop_outbound_string(&intern->session_obj);
+    if (ZSTR_LEN(outbound) > 0) {
+        result = nghttp2_client_ssl_write_all(intern, outbound);
+    }
+    zend_string_release(outbound);
+
+    return result;
+}
+
+static void nghttp2_client_append_header_pair(zval *headers, zval *pair)
+{
+    zval header;
+    zval *name;
+    zval *value;
+
+    name = zend_hash_str_find(Z_ARRVAL_P(pair), "name", sizeof("name") - 1);
+    value = zend_hash_str_find(Z_ARRVAL_P(pair), "value", sizeof("value") - 1);
+    if (name == NULL || value == NULL || Z_TYPE_P(name) != IS_STRING || Z_TYPE_P(value) != IS_STRING) {
+        return;
+    }
+
+    array_init(&header);
+    add_assoc_str(&header, "name", zend_string_copy(Z_STR_P(name)));
+    add_assoc_str(&header, "value", zend_string_copy(Z_STR_P(value)));
+    add_next_index_zval(headers, &header);
+}
+
+static void nghttp2_client_process_session_events(nghttp2_client_object *intern)
+{
+    zval events;
+    zval *event;
+
+    nghttp2_session_pop_events_array(&intern->session_obj, &events);
+
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL(events), event) {
+        zval *type;
+        zval *stream_id;
+
+        if (Z_TYPE_P(event) != IS_ARRAY) {
+            continue;
+        }
+
+        type = zend_hash_str_find(Z_ARRVAL_P(event), "type", sizeof("type") - 1);
+        stream_id = zend_hash_str_find(Z_ARRVAL_P(event), "streamId", sizeof("streamId") - 1);
+        if (type == NULL || Z_TYPE_P(type) != IS_STRING || stream_id == NULL || zval_get_long(stream_id) != intern->stream_id) {
+            continue;
+        }
+
+        if (zend_string_equals_literal(Z_STR_P(type), "headers")) {
+            zval *headers = zend_hash_str_find(Z_ARRVAL_P(event), "headers", sizeof("headers") - 1);
+            zval *header;
+
+            if (headers == NULL || Z_TYPE_P(headers) != IS_ARRAY) {
+                continue;
+            }
+
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(headers), header) {
+                zval *name;
+                zval *value;
+                zend_long parsed = 0;
+
+                if (Z_TYPE_P(header) != IS_ARRAY) {
+                    continue;
+                }
+
+                name = zend_hash_str_find(Z_ARRVAL_P(header), "name", sizeof("name") - 1);
+                value = zend_hash_str_find(Z_ARRVAL_P(header), "value", sizeof("value") - 1);
+                if (name == NULL || value == NULL || Z_TYPE_P(name) != IS_STRING || Z_TYPE_P(value) != IS_STRING) {
+                    continue;
+                }
+
+                if (zend_string_equals_literal(Z_STR_P(name), ":status")) {
+                    if (is_numeric_string(Z_STRVAL_P(value), Z_STRLEN_P(value), &parsed, NULL, 0) == IS_LONG) {
+                        intern->status = parsed;
+                        intern->has_status = 1;
+                    }
+                    continue;
+                }
+
+                nghttp2_client_append_header_pair(&intern->response_headers, header);
+            } ZEND_HASH_FOREACH_END();
+        } else if (zend_string_equals_literal(Z_STR_P(type), "data")) {
+            zval *data = zend_hash_str_find(Z_ARRVAL_P(event), "data", sizeof("data") - 1);
+
+            if (data != NULL && Z_TYPE_P(data) == IS_STRING) {
+                smart_str_appendl(&intern->response_body, Z_STRVAL_P(data), Z_STRLEN_P(data));
+            }
+        } else if (zend_string_equals_literal(Z_STR_P(type), "stream_close")) {
+            intern->stream_closed = 1;
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zval_ptr_dtor(&events);
+}
+
+static void nghttp2_client_request_headers_append(zval *headers, const char *name, zend_string *value)
+{
+    zval pair;
+
+    array_init(&pair);
+    add_assoc_string(&pair, "name", (char *)name);
+    add_assoc_str(&pair, "value", zend_string_copy(value));
+    add_next_index_zval(headers, &pair);
 }
 
 static zend_object *nghttp2_client_create_object(zend_class_entry *ce)
@@ -329,7 +346,7 @@ static zend_object *nghttp2_client_create_object(zend_class_entry *ce)
     intern->fd = -1;
     intern->ssl_ctx = NULL;
     intern->ssl = NULL;
-    intern->session = NULL;
+    ZVAL_UNDEF(&intern->session_obj);
     intern->host = NULL;
     intern->port = 443;
     intern->stream_id = -1;
@@ -428,9 +445,14 @@ ZEND_METHOD(Nghttp2_Client, __construct)
         RETURN_THROWS();
     }
 
-    if (nghttp2_client_session_init(intern) != SUCCESS) {
+    if (nghttp2_session_create(&intern->session_obj, 0) != SUCCESS) {
         nghttp2_client_close_connection(intern);
-        nghttp2_throw_client_exception("failed to initialize HTTP/2 session", NGHTTP2_ERR_PROTO);
+        nghttp2_client_rethrow_session_exception("failed to initialize HTTP/2 session", NGHTTP2_ERR_PROTO);
+        RETURN_THROWS();
+    }
+
+    if (nghttp2_client_flush_session_outbound(intern) != SUCCESS) {
+        nghttp2_client_close_connection(intern);
         RETURN_THROWS();
     }
 
@@ -442,15 +464,11 @@ ZEND_METHOD(Nghttp2_Client, request)
     zend_string *path;
     zval *headers = NULL;
     zval normalized_headers;
+    zval request_headers;
     nghttp2_client_object *intern = Z_NGHTTP2_CLIENT_OBJ_P(ZEND_THIS);
     uint8_t rbuf[16 * 1024];
     zend_string *authority;
-    uint32_t extra_headers = 0;
-    uint32_t nvlen;
-    nghttp2_nv *nva;
-    nghttp2_nv *custom_nva = NULL;
-    size_t custom_nvlen = 0;
-    int rv;
+    int32_t submitted_stream_id;
 
     ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STR(path)
@@ -459,12 +477,15 @@ ZEND_METHOD(Nghttp2_Client, request)
     ZEND_PARSE_PARAMETERS_END();
 
     ZVAL_UNDEF(&normalized_headers);
+    array_init(&request_headers);
 
-    if (intern->session == NULL || intern->ssl == NULL) {
+    if (Z_TYPE(intern->session_obj) == IS_UNDEF || intern->ssl == NULL) {
+        zval_ptr_dtor(&request_headers);
         nghttp2_throw_client_exception("connection is closed", NGHTTP2_ERR_INVALID_STATE);
         RETURN_THROWS();
     }
     if (intern->request_in_progress) {
+        zval_ptr_dtor(&request_headers);
         nghttp2_throw_client_exception("another request is already in progress", NGHTTP2_ERR_INVALID_STATE);
         RETURN_THROWS();
     }
@@ -473,61 +494,28 @@ ZEND_METHOD(Nghttp2_Client, request)
     if (headers != NULL) {
         if (nghttp2_headers_normalize(headers, &normalized_headers, NGHTTP2_HEADERS_NORMALIZE_ALLOW_ASSOC) != SUCCESS) {
             zend_string_release(authority);
+            zval_ptr_dtor(&request_headers);
             RETURN_THROWS();
         }
-        if (nghttp2_headers_build_nv_array(&normalized_headers, &custom_nva, &custom_nvlen) != SUCCESS) {
-            zend_string_release(authority);
-            zval_ptr_dtor(&normalized_headers);
-            RETURN_THROWS();
-        }
-        extra_headers = (uint32_t)custom_nvlen;
     }
 
-    nvlen = 6 + extra_headers;
-    nva = ecalloc(nvlen, sizeof(nghttp2_nv));
+    nghttp2_client_request_headers_append(&request_headers, ":method", zend_string_init("GET", sizeof("GET") - 1, 0));
+    nghttp2_client_request_headers_append(&request_headers, ":scheme", zend_string_init("https", sizeof("https") - 1, 0));
+    nghttp2_client_request_headers_append(&request_headers, ":authority", authority);
+    nghttp2_client_request_headers_append(&request_headers, ":path", path);
+    nghttp2_client_request_headers_append(&request_headers, "user-agent", zend_string_init("php-nghttp2-client/0.1", sizeof("php-nghttp2-client/0.1") - 1, 0));
+    nghttp2_client_request_headers_append(&request_headers, "accept", zend_string_init("*/*", sizeof("*/*") - 1, 0));
 
-    nva[0].name = (uint8_t *)":method";
-    nva[0].namelen = sizeof(":method") - 1;
-    nva[0].value = (uint8_t *)"GET";
-    nva[0].valuelen = sizeof("GET") - 1;
-    nva[0].flags = NGHTTP2_NV_FLAG_NONE;
-
-    nva[1].name = (uint8_t *)":scheme";
-    nva[1].namelen = sizeof(":scheme") - 1;
-    nva[1].value = (uint8_t *)"https";
-    nva[1].valuelen = sizeof("https") - 1;
-    nva[1].flags = NGHTTP2_NV_FLAG_NONE;
-
-    nva[2].name = (uint8_t *)":authority";
-    nva[2].namelen = sizeof(":authority") - 1;
-    nva[2].value = (uint8_t *)ZSTR_VAL(authority);
-    nva[2].valuelen = ZSTR_LEN(authority);
-    nva[2].flags = NGHTTP2_NV_FLAG_NONE;
-
-    nva[3].name = (uint8_t *)":path";
-    nva[3].namelen = sizeof(":path") - 1;
-    nva[3].value = (uint8_t *)ZSTR_VAL(path);
-    nva[3].valuelen = ZSTR_LEN(path);
-    nva[3].flags = NGHTTP2_NV_FLAG_NONE;
-
-    nva[4].name = (uint8_t *)"user-agent";
-    nva[4].namelen = sizeof("user-agent") - 1;
-    nva[4].value = (uint8_t *)"php-nghttp2-client/0.1";
-    nva[4].valuelen = sizeof("php-nghttp2-client/0.1") - 1;
-    nva[4].flags = NGHTTP2_NV_FLAG_NONE;
-
-    nva[5].name = (uint8_t *)"accept";
-    nva[5].namelen = sizeof("accept") - 1;
-    nva[5].value = (uint8_t *)"*/*";
-    nva[5].valuelen = sizeof("*/*") - 1;
-    nva[5].flags = NGHTTP2_NV_FLAG_NONE;
-
-    if (custom_nva != NULL) {
-        memcpy(&nva[6], custom_nva, custom_nvlen * sizeof(*custom_nva));
-        efree(custom_nva);
-        custom_nva = NULL;
-    }
     if (Z_TYPE(normalized_headers) != IS_UNDEF) {
+        zval *header;
+
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL(normalized_headers), header) {
+            if (Z_TYPE_P(header) != IS_ARRAY) {
+                continue;
+            }
+            Z_TRY_ADDREF_P(header);
+            add_next_index_zval(&request_headers, header);
+        } ZEND_HASH_FOREACH_END();
         zval_ptr_dtor(&normalized_headers);
     }
 
@@ -535,26 +523,25 @@ ZEND_METHOD(Nghttp2_Client, request)
     intern->stream_closed = 0;
     intern->request_in_progress = 1;
 
-    intern->stream_id = nghttp2_submit_request(intern->session, NULL, nva, nvlen, NULL, NULL);
-    zend_string_release(authority);
-    efree(nva);
-
-    if (intern->stream_id < 0) {
+    if (nghttp2_session_submit_request_headers(&intern->session_obj, &request_headers, 1, &submitted_stream_id) != SUCCESS) {
         intern->request_in_progress = 0;
-        nghttp2_throw_client_exception("failed to submit request", intern->stream_id);
+        zend_string_release(authority);
+        zval_ptr_dtor(&request_headers);
+        nghttp2_client_rethrow_session_exception("failed to submit request", NGHTTP2_ERR_CALLBACK_FAILURE);
+        RETURN_THROWS();
+    }
+
+    intern->stream_id = submitted_stream_id;
+    zend_string_release(authority);
+    zval_ptr_dtor(&request_headers);
+
+    if (nghttp2_client_flush_session_outbound(intern) != SUCCESS) {
+        intern->request_in_progress = 0;
         RETURN_THROWS();
     }
 
     while (!intern->stream_closed) {
-        ssize_t fed;
         int n;
-
-        rv = nghttp2_session_send(intern->session);
-        if (rv != 0) {
-            intern->request_in_progress = 0;
-            nghttp2_throw_client_exception(nghttp2_strerror(rv), rv);
-            RETURN_THROWS();
-        }
 
         n = SSL_read(intern->ssl, rbuf, sizeof(rbuf));
         if (n <= 0) {
@@ -563,15 +550,20 @@ ZEND_METHOD(Nghttp2_Client, request)
             RETURN_THROWS();
         }
 
-        fed = nghttp2_session_mem_recv(intern->session, rbuf, (size_t)n);
-        if (fed < 0) {
+        if (nghttp2_session_receive_bytes(&intern->session_obj, rbuf, (size_t)n, NULL) != SUCCESS) {
             intern->request_in_progress = 0;
-            nghttp2_throw_client_exception(nghttp2_strerror((int)fed), (int)fed);
+            nghttp2_client_rethrow_session_exception("failed to process response bytes", NGHTTP2_ERR_PROTO);
+            RETURN_THROWS();
+        }
+
+        nghttp2_client_process_session_events(intern);
+
+        if (nghttp2_client_flush_session_outbound(intern) != SUCCESS) {
+            intern->request_in_progress = 0;
             RETURN_THROWS();
         }
     }
 
-    (void)nghttp2_session_send(intern->session);
     intern->request_in_progress = 0;
     intern->stream_id = -1;
 

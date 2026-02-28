@@ -33,5 +33,6 @@ void nghttp2_throw_session_exception(const char *message, int error_code);
 zend_bool nghttp2_headers_is_reserved_response_name(const zend_string *name);
 int nghttp2_headers_normalize(zval *headers, zval *normalized, uint32_t flags);
 int nghttp2_headers_build_nv_array(zval *headers, nghttp2_nv **nva_out, size_t *nvlen_out);
+int nghttp2_submit_default_settings(nghttp2_session *session);
 
 #endif

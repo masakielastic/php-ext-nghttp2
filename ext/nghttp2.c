@@ -149,6 +149,16 @@ int nghttp2_headers_build_nv_array(zval *headers, nghttp2_nv **nva_out, size_t *
     return SUCCESS;
 }
 
+int nghttp2_submit_default_settings(nghttp2_session *session)
+{
+    nghttp2_settings_entry iv[1];
+
+    iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
+    iv[0].value = 100;
+
+    return nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, iv, 1);
+}
+
 PHP_MINIT_FUNCTION(nghttp2)
 {
     nghttp2_register_exception_class();

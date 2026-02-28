@@ -291,7 +291,6 @@ static int nghttp2_client_on_stream_close_cb(
 static int nghttp2_client_session_init(nghttp2_client_object *intern)
 {
     nghttp2_session_callbacks *cbs = NULL;
-    nghttp2_settings_entry iv[1];
     int rv;
 
     rv = nghttp2_session_callbacks_new(&cbs);
@@ -310,10 +309,7 @@ static int nghttp2_client_session_init(nghttp2_client_object *intern)
         return FAILURE;
     }
 
-    iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
-    iv[0].value = 100;
-
-    rv = nghttp2_submit_settings(intern->session, NGHTTP2_FLAG_NONE, iv, 1);
+    rv = nghttp2_submit_default_settings(intern->session);
     if (rv != 0) {
         return FAILURE;
     }

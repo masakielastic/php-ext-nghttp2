@@ -364,7 +364,6 @@ static nghttp2_session *nghttp2_server_setup_session(nghttp2_server_conn_ctx *co
 {
     nghttp2_session_callbacks *cbs = NULL;
     nghttp2_session *session = NULL;
-    nghttp2_settings_entry iv[1];
     int rv;
 
     rv = nghttp2_session_callbacks_new(&cbs);
@@ -382,9 +381,7 @@ static nghttp2_session *nghttp2_server_setup_session(nghttp2_server_conn_ctx *co
         return NULL;
     }
 
-    iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
-    iv[0].value = 100;
-    rv = nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, iv, 1);
+    rv = nghttp2_submit_default_settings(session);
     if (rv != 0) {
         nghttp2_session_del(session);
         return NULL;

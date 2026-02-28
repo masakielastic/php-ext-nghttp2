@@ -649,7 +649,7 @@ static int nghttp2_session_initialize(nghttp2_session_object *intern, zend_bool 
     nghttp2_session_reset_outbound(intern);
     nghttp2_session_clear_stream_states(intern);
 
-    rv = nghttp2_submit_settings(intern->session, NGHTTP2_FLAG_NONE, NULL, 0);
+    rv = nghttp2_submit_default_settings(intern->session);
     if (rv != 0) {
         nghttp2_session_release(intern, 1);
         nghttp2_throw_session_exception(nghttp2_strerror(rv), rv);
